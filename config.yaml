@@ -1,0 +1,129 @@
+search:
+  # 搜索词，逐个跑，结果合并去重
+  terms:
+  # AI 方向优先 —— 当前重点求职方向
+  - AI Engineer
+  - LLM Engineer
+  - AI Software Engineer
+  - AI Product Engineer
+  - Generative AI Engineer
+  - Full Stack Developer AI
+  # web/全栈基础盘,兜住 AI 方向没覆盖到的岗位
+  - Junior Full Stack Developer
+  - Frontend Developer React
+  - Graduate Software Engineer
+  location: "Melbourne VIC"   # 改成 Sydney NSW / Brisbane QLD 等
+  country: "australia"
+  results_per_term: 50
+  hours_old: 336              # 只要 7 天内的岗位
+  is_remote: false
+
+sources:
+  linkedin: true      # 实测可用
+  indeed: true        # 实测可用(hours_old 不传给它,改成抓完按日期自己过滤)
+  seek: true          # 实测可用,端点 = jobsearch/v5
+
+  # LinkedIn 限流严重，抓 description 会更慢更容易被封
+  linkedin_fetch_description: true
+  # 可选代理，格式 "user:pass@host:port" 或 "host:port"
+  proxies: []
+
+seek:
+  # SEEK 岗位分类：6281 = Information & Communication Technology
+  classification: "6281"
+  # SEEK 的地区 slug
+  location_slug: "All-Melbourne-VIC"
+
+visa:
+  # 你的情况：485 毕业生工签 + 需要后续担保
+  status: "485_needs_sponsorship"
+  # 命中这些词 → 直接淘汰（硬性排除）
+  exclude_keywords:
+  - must be an australian citizen
+  - australian citizenship is required
+  - australian citizenship required
+  - citizens only
+  - must hold or be able to obtain a security clearance
+  - nv1
+  - nv2
+  - baseline clearance
+  - permanent residents only
+  - pr only
+  - must have full working rights permanently
+  - no visa sponsorship
+  - unable to provide sponsorship
+  - not able to sponsor
+  - we do not sponsor
+  bonus_keywords:
+  - visa sponsorship
+  - sponsorship available
+  - willing to sponsor
+  - '482'
+  - tss visa
+  - skilled visa
+  - we can sponsor
+llm:
+  # provider: anthropic | openai | deepseek
+  # 想用 DeepSeek:改成 "deepseek",export DEEPSEEK_API_KEY=... 就行,
+  # 接口是 OpenAI 兼容的,不用额外装包。便宜很多,打分这种量大但不复杂的
+  # 任务用它性价比高。
+  provider: "deepseek"
+  anthropic_model: "claude-sonnet-5"
+  openai_model: "gpt-4o"
+  # 2026-07-22 核实:DeepSeek 旧模型名 deepseek-chat 即将弃用,用新名字
+  deepseek_model: "deepseek-v4-flash"
+  # 打分时每批多少个岗位
+  batch_size: 8
+  # description 截断长度，控制 token 成本
+  max_description_chars: 4000
+
+scoring:
+  # 以下两项只在显式加 --generate 时才生效,默认流程(打分排序)不用。
+  # 分数 >= 这个值才生成简历和 cover letter
+  # junior 阶段设 70:大部分 JD 会列一堆"nice to have",
+  # 卡 75 会漏掉不少其实可以投的岗位
+  generate_threshold: 70
+  # 最多生成多少份，防止一次烧太多 token
+  max_generate: 15
+
+applypilot:
+  # 当前 Codex Agent 加载此 Skill 后连续完成搜索、评分、Dashboard 同步和允许的投递。
+  skill_path: "/Users/pengwang/.codex/skills/applypilot-au"
+  autonomous: true
+  # 轻度自动投递：LinkedIn / Indeed / SEEK 原站默认由用户完成平台操作。
+  # 直接外部 ATS 只有在当前规则允许且所有安全门通过时，才交给 Agent 自动提交。
+  automation_mode: "light"
+  auto_submit_enabled: true
+  timezone: "Australia/Melbourne"
+  soft_target_per_day: 30
+  hard_cap_per_day: 40
+  audit_batch_size: 5
+
+application:
+  # 岗位发布时间用于日常行动队列，不会删除未知或更早的岗位。
+  priority_within_hours: 24
+  recent_within_hours: 72
+  # 只有 entry/new grad/junior 默认进入自动准备队列，其他级别留给人工审核。
+  eligible_seniority_keywords: [graduate, new grad, entry, junior, jnr]
+  excluded_seniority_keywords: [senior, staff, principal, lead, manager, director]
+  # job-fit 与 resume-fit 都达到 targeted 阈值才走精投；否则达到 broad 阈值走海投。
+  targeted_job_fit_threshold: 80
+  targeted_resume_fit_threshold: 72
+  broad_job_fit_threshold: 70
+  # 这里控制 Agent 是否能生成内部执行记录；JobHunter 本身仍不操作招聘网站。
+  browser_enabled: true
+
+dedupe:
+  # 模糊匹配阈值（0-100），同公司内比较 title
+  fuzzy_threshold: 88
+
+paths:
+  resume: "profile/resume.md"
+  preferences: "profile/preferences.md"
+  candidate_profile: "profile/candidate_profile.md"
+  resume_manifest: "profile/resumes/manifest.yaml"
+  dashboard: "data/application-dashboard.csv"
+  application_events: "data/application-events.csv"
+  application_attempts: "data/application-attempts.csv"
+  scoring_rule_backups: "data/scoring-rule-backups"
+  output_dir: "output"

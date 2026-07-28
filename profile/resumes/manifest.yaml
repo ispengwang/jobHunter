@@ -1,0 +1,23 @@
+# 每一份简历都必须只包含 Candidate Profile / 原始简历中可证实的事实。
+# 新增变体时，把 Markdown 文件放在 profile/resumes/ 下，再在这里加入一项。
+resumes:
+  - id: resume-default
+    path: profile/resume.md
+    label: Default resume
+    target_roles:
+      - AI Engineer
+      - LLM Engineer
+      - AI Software Engineer
+      - AI Product Engineer
+      - Generative AI Engineer
+      - Full Stack Developer
+      - Frontend Developer
+      - Graduate Software Engineer
+    keywords:
+      - AI
+      - LLM
+      - React
+      - TypeScript
+      - Node.js
+      - full-stack
+    seniority: [graduate, entry, junior]

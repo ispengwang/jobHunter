@@ -1,0 +1,13 @@
+venv/
+.codegraph/
+__pycache__/
+*.pyc
+output/
+data/
+profile/candidate_profile.md
+profile/answer_bank.md
+profile/application_accounts.md
+profile/resume.md
+profile/preferences.md
+profile/resumes/*.md
+.DS_Store
