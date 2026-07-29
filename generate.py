@@ -39,6 +39,23 @@ _RESUME_SYSTEM = """你是一位澳洲本地的技术简历顾问。
 只输出简历 Markdown,不要任何前后说明。"""
 
 
+_LIGHT_RESUME_SYSTEM = """你只负责对一份已经审核过的候选人简历做最小幅度的 ATS 定制。
+
+这是海投材料，不是重新写简历。你的输出必须保留原简历的全部事实和结构证据。
+
+允许且仅允许:
+- 重排现有 section 或现有 bullet 的顺序，让岗位相关内容靠前
+- 在原句事实不变的前提下，把一个词或很短的短语替换成 JD 的同义术语
+
+绝对禁止:
+- 新增任何技能、工具、公司、职位、项目、职责、数字、日期或资格
+- 不得删除、合并、拆分或扩写 bullet；不得整篇重写，或改变原简历的事实结构
+- 把 JD 关键词硬塞进没有事实依据的句子
+- 把“接触过/参与过”升级成“负责/主导/精通”，或改变任何数字和程度
+
+如果没有完全安全的调整，就原样保留相关内容。输出完整 Markdown 简历，不要前后说明。"""
+
+
 _COVER_SYSTEM = """你是一位澳洲本地的求职信写手。
 
 写一封 cover letter,Markdown 格式,严格控制在 250-320 词。
@@ -60,6 +77,78 @@ _COVER_SYSTEM = """你是一位澳洲本地的求职信写手。
 - 不得主动提及签证状态,除非 JD 明确要求说明工作权利
 
 只输出信件正文 Markdown,不要任何前后说明。"""
+
+
+_ATS_REPLACEMENTS = (
+    ("node.js", "nodejs"),
+    ("react.js", "reactjs"),
+    ("next.js", "nextjs"),
+    ("ci/cd", "cicd"),
+    ("c++", "cplusplus"),
+    ("c#", "csharp"),
+    (".net", "dotnet"),
+)
+
+
+def _normalise_ats_text(value: str | None) -> str:
+    """Normalise punctuation variants without making fuzzy claims about a skill."""
+    text = str(value or "").casefold()
+    for source, replacement in _ATS_REPLACEMENTS:
+        text = text.replace(source, replacement)
+    return " ".join(re.findall(r"[a-z0-9]+", text))
+
+
+def _contains_ats_keyword(text: str, keyword: str) -> bool:
+    needle = _normalise_ats_text(keyword)
+    haystack = _normalise_ats_text(text)
+    return bool(needle and f" {needle} " in f" {haystack} ")
+
+
+def extract_hard_keywords(s: Scored) -> list[str]:
+    """Use the existing DeepSeek matched/missing fields as ATS keyword candidates.
+
+    ``score.py`` already asks the single scoring call for evidence-backed requirements. Keeping
+    this extraction local avoids another model request and prevents a second, inconsistent
+    interpretation of the JD.
+    """
+    keywords: list[str] = []
+    seen: set[str] = set()
+    for raw in [*(s.matched or []), *(s.missing or [])]:
+        for item in re.split(r"\s*(?:,|;)\s*|\s+/\s+", str(raw or "")):
+            keyword = re.sub(r"\s+", " ", item.strip(" -*•\t"))
+            normalised = _normalise_ats_text(keyword)
+            if keyword and normalised and normalised not in seen:
+                seen.add(normalised)
+                keywords.append(keyword)
+    return keywords
+
+
+def keyword_coverage(
+    s: Scored,
+    generated_resume: str,
+    candidate_resume: str,
+) -> dict[str, object]:
+    """Measure generated-resume coverage and classify uncovered verified facts safely."""
+    keywords = extract_hard_keywords(s)
+    covered = [keyword for keyword in keywords if _contains_ats_keyword(generated_resume, keyword)]
+    uncovered = [keyword for keyword in keywords if keyword not in covered]
+    candidate_has_but_omitted = [
+        keyword for keyword in uncovered if _contains_ats_keyword(candidate_resume, keyword)
+    ]
+    candidate_unverified_or_missing = [
+        keyword for keyword in uncovered if keyword not in candidate_has_but_omitted
+    ]
+    total = len(keywords)
+    return {
+        "keywords": keywords,
+        "covered": covered,
+        "uncovered": uncovered,
+        "candidate_has_but_omitted": candidate_has_but_omitted,
+        "candidate_unverified_or_missing": candidate_unverified_or_missing,
+        "covered_count": len(covered),
+        "total_count": total,
+        "coverage_percent": round(len(covered) * 100 / total, 1) if total else None,
+    }
 
 
 def _safe_name(s: str, limit: int = 40) -> str:
@@ -88,7 +177,11 @@ def _job_context(s: Scored, max_chars: int) -> str:
 {desc}"""
 
 
-def _write_summary(out_dir: Path, s: Scored) -> None:
+def _write_summary(
+    out_dir: Path,
+    s: Scored,
+    coverage: dict[str, object] | None = None,
+) -> None:
     job = s.job
     dup = "\n".join(f"- {u}" for u in job.duplicate_urls) or "- (无)"
     salary = job.salary_raw or "未列出"
@@ -97,6 +190,32 @@ def _write_summary(out_dir: Path, s: Scored) -> None:
         "explicit_no": "⚠️ JD 提到 sponsorship 但疑似否定表述,投前请自行确认",
         "unknown": "— JD 未提及签证",
     }[s.sponsorship_signal]
+    if coverage is None:
+        keyword_section = "## ATS 关键词覆盖\n- 简历尚未生成，暂未计算。"
+    else:
+        total = int(coverage["total_count"])
+        covered_count = int(coverage["covered_count"])
+        percent = coverage["coverage_percent"]
+        rate = (
+            f"{percent:g}%（{covered_count}/{total}）"
+            if percent is not None else "N/A（DeepSeek 未返回硬关键词）"
+        )
+        uncovered = coverage["uncovered"] or []
+        has_but_omitted = coverage["candidate_has_but_omitted"] or []
+        unverified_or_missing = coverage["candidate_unverified_or_missing"] or []
+        keyword_section = f"""## ATS 关键词覆盖
+**覆盖率**: {rate}
+**已覆盖**: {', '.join(coverage['covered']) or '—'}
+**未覆盖关键词**: {', '.join(uncovered) or '—'}
+
+### 候选人确实具备但生成简历没写出来（应补）
+{', '.join(has_but_omitted) or '—'}
+
+### 候选人未验证/不具备（永远不得添加）
+{', '.join(unverified_or_missing) or '—'}
+
+> “未验证/不具备”表示原始候选人简历没有可核对证据；这不是允许猜测或补写事实。
+"""
 
     (out_dir / "00-summary.md").write_text(f"""# {job.title} — {job.company}
 
@@ -129,6 +248,8 @@ def _write_summary(out_dir: Path, s: Scored) -> None:
 
 ## 待补强 — 面试大概率会问
 {chr(10).join('- ' + m for m in s.missing) or '- —'}
+
+{keyword_section}
 
 ## 投递前检查
 - [ ] 简历里的每一句都属实
@@ -184,6 +305,13 @@ def generate(scored: list[Scored], llm, resume: str, preferences: str,
             else:
                 log.warning("岗位 %s 指定的简历不存在，退回默认简历: %s", job.id, selected_path)
 
+        light_tailoring = s.application_mode == "broad" and s.resume_id
+        resume_instruction = (
+            "请只做轻量 ATS 调整：仅重排现有 bullet/section，或做不改变事实的同义词微调；"
+            "不得整篇重写、增删 bullet 或新增任何事实。"
+            if light_tailoring else
+            "请针对这个岗位重组简历。记住:不得编造。"
+        )
         user_resume = f"""# 候选人原始简历
 {selected_resume}
 
@@ -193,7 +321,7 @@ def generate(scored: list[Scored], llm, resume: str, preferences: str,
 # 目标岗位
 {context}
 
-请针对这个岗位重组简历。记住:不得编造。"""
+{resume_instruction}"""
 
         user_cover = f"""# 候选人简历
 {selected_resume}
@@ -207,14 +335,16 @@ def generate(scored: list[Scored], llm, resume: str, preferences: str,
 请写这封 cover letter。记住:不得编造,不要主动提签证。"""
 
         try:
-            # Broad applications deliberately use a pre-approved stable resume.
-            # Rewriting it adds cost and can introduce unsupported claims; only
-            # targeted applications may ask the model to reorganise resume facts.
-            if s.application_mode == "broad" and s.resume_id:
-                (out_dir / "resume.md").write_text(selected_resume, encoding="utf-8")
+            if light_tailoring:
+                tailored = str(llm.complete(_LIGHT_RESUME_SYSTEM, user_resume, max_tokens=3000) or "")
             else:
-                tailored = llm.complete(_RESUME_SYSTEM, user_resume, max_tokens=4096)
-                (out_dir / "resume.md").write_text(tailored, encoding="utf-8")
+                tailored = str(llm.complete(_RESUME_SYSTEM, user_resume, max_tokens=4096) or "")
+            generated_resume = tailored if tailored.strip() else selected_resume
+            (out_dir / "resume.md").write_text(generated_resume, encoding="utf-8")
+            _write_summary(
+                out_dir, s,
+                keyword_coverage(s, generated_resume, selected_resume),
+            )
 
             cover = llm.complete(_COVER_SYSTEM, user_cover, max_tokens=1500)
             (out_dir / "cover-letter.md").write_text(cover, encoding="utf-8")

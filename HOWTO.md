@@ -113,7 +113,7 @@ output/applications/
     cover-letter.md
 ```
 
-`00-summary.md` 里有投递链接和一个 checklist。**每一份都要自己读一遍**，重点确认简历里没有被 AI 润色出来的、你其实没做过的事。使用完整 Agent 流程时，这些材料会被内部执行记录引用，不需要手动加入队列。
+`00-summary.md` 里有投递链接、ATS 关键词覆盖率、未覆盖关键词的事实分类和一个 checklist。**每一份都要自己读一遍**，重点确认简历里没有被 AI 润色出来的、你其实没做过的事。使用完整 Agent 流程时，这些材料会被内部执行记录引用，不需要手动加入队列。
 
 完整流程仍可直接在 Codex 调用 `applypilot-au`；如果只想投某一个岗位，则在 `/dashboard` 点击对应卡片的按钮。按钮只会加入本地投递清单，不启动后台进程；当前 Agent 用 `venv/bin/python run.py --handoff-list` 读取。真实投递仍以 Skill 的平台模式、平台限额和提交证据规则为准。详见 [BROWSER_APPLICATION_RUNBOOK.md](BROWSER_APPLICATION_RUNBOOK.md)。
 

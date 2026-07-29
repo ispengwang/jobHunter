@@ -254,6 +254,8 @@ if written:
     check_true("summary 含申请链接", "https://" in summary)
     check_true("summary 含 checklist", "投递前检查" in summary)
     check_true("summary 含签证信号", "签证信号" in summary)
+    check_true("summary 含 ATS 关键词覆盖", "ATS 关键词覆盖" in summary)
+    check_true("summary 含未覆盖关键词分类", "永远不得添加" in summary)
 
     names = sorted(p.name for p in tmp.glob("applications/*"))
     check_true("目录名以分数开头便于排序", names[0][:3].isdigit(), names[0])

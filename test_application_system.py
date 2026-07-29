@@ -19,6 +19,7 @@ from application_attempts import (
 )
 from candidate_profile import UNKNOWN, load_or_initialise, save_profile
 from dashboard import Dashboard
+from generate import generate, keyword_coverage
 from resume_catalog import choose_resume, ensure_default_manifest, load_catalog
 from schema import Job
 from score import Scored, build_scoring_input, score_jobs
@@ -256,18 +257,33 @@ try:
     check("漏项重试只发送缺失岗位", omits_once.requested_ids[1], [second_job.id])
     check("漏项重试后没有无效分数", all(item.score >= 0 for item in retried_scores))
 
+    print("\n=== ATS keyword coverage ===")
+    coverage_probe = Scored(
+        job, 78, "可海投", ["React", "Node.js"], ["AWS", "Kubernetes"], "unknown",
+    )
+    coverage = keyword_coverage(coverage_probe, "React", "React and Node.js")
+    check("ATS 关键词来自 matched/missing", coverage["keywords"], ["React", "Node.js", "AWS", "Kubernetes"])
+    check("ATS 覆盖率按生成简历计算", coverage["coverage_percent"], 25.0)
+    check("候选人具备但生成简历漏写单独列出", coverage["candidate_has_but_omitted"], ["Node.js"])
+    check("候选人未验证关键词不得混入应补清单", coverage["candidate_unverified_or_missing"], ["AWS", "Kubernetes"])
+
     print("\n=== Broad application materials ===")
-    from generate import generate
 
     class MaterialsLLM:
         max_description_chars = 4000
 
         def __init__(self):
             self.calls = 0
+            self.resume_systems = []
+            self.cover_calls = 0
 
         def complete(self, system, user, max_tokens=4096):
             self.calls += 1
-            return "Verified cover letter"
+            if "求职信" in system or "cover letter" in system.lower():
+                self.cover_calls += 1
+                return "Verified cover letter"
+            self.resume_systems.append(system)
+            return "# Verified light-tailored resume\n\nReact\n"
 
     broad = Scored(job, 78, "可海投", ["React"], [], "unknown")
     broad.resume_id = "resume-default"
@@ -284,11 +300,16 @@ try:
     )
     check("海投材料已生成", len(broad_written), 1)
     check(
-        "海投使用原始已审核简历",
+        "海投经过轻量定制",
         (broad_written[0] / "resume.md").read_text(encoding="utf-8"),
-        resume_path.read_text(encoding="utf-8"),
+        "# Verified light-tailored resume\n\nReact\n",
     )
-    check("海投只调用模型生成求职信", material_llm.calls, 1)
+    check("海投轻量 prompt 禁止整篇重写", "不得整篇重写" in material_llm.resume_systems[0], True)
+    check("海投生成简历和求职信", material_llm.calls, 2)
+    check("海投只调用一次求职信生成", material_llm.cover_calls, 1)
+    broad_summary = (broad_written[0] / "00-summary.md").read_text(encoding="utf-8")
+    check("summary 含 ATS 覆盖率", "ATS 关键词覆盖" in broad_summary, True)
+    check("summary 含不得添加分类", "永远不得添加" in broad_summary, True)
     relative_material_cfg = {
         "scoring": {"generate_threshold": 70, "max_generate": 5},
         "paths": {"output_dir": "material-output"},
