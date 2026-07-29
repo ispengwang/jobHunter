@@ -9,7 +9,7 @@ import tempfile
 
 import yaml
 
-from application_policy import decide_application_mode, freshness_bucket
+from application_policy import _min_years_required, decide_application_mode, freshness_bucket
 from application_attempts import ApplicationAttempts, platform_submission_mode
 from applypilot_executor import ExecutionSnapshot, build_agent_prompt
 from candidate_profile import UNKNOWN, load_or_initialise, save_profile
@@ -63,6 +63,7 @@ try:
             "priority_within_hours": 24, "recent_within_hours": 72,
             "eligible_seniority_keywords": ["graduate", "entry", "junior", "jnr"],
             "excluded_seniority_keywords": ["senior", "staff", "principal", "lead", "manager"],
+            "max_years_experience": 2,
             "targeted_job_fit_threshold": 80, "targeted_resume_fit_threshold": 72,
             "broad_job_fit_threshold": 70,
         },
@@ -112,6 +113,46 @@ try:
     senior = Job("seek", "Senior AI Product Engineer", "Acme", "https://example.test/jobs/2", posted_date=job.posted_date)
     senior_decision = decide_application_mode(Scored(senior, 95, "x", [], [], "unknown"), selection, cfg, now)
     check("Senior 默认进入人工判断", senior_decision.mode, "manual_review")
+    check("标题命中白名单并写入依据", "标题命中级别词 junior" in decision.reason)
+    check("黑名单依据包含命中词", "senior" in senior_decision.reason)
+    years_job = Job(
+        "seek", "Software Engineer", "YearsCo", "https://example.test/jobs/years",
+        description="This role requires 5+ years of professional experience.",
+    )
+    years_decision = decide_application_mode(
+        Scored(years_job, 85, "x", [], [], "unknown"), selection, cfg, now,
+    )
+    check("独立函数提取 5 年要求", _min_years_required(years_job.description), 5)
+    check("JD 要求 5 年进入人工判断", years_decision.mode, "manual_review")
+    check("人工判断理由保留年限原文", "5+ years" in years_decision.reason)
+    one_year_job = Job(
+        "seek", "Software Engineer", "OneYearCo", "https://example.test/jobs/one-year",
+        description="Minimum 1 year experience is preferred; mentoring is available.",
+    )
+    one_year_decision = decide_application_mode(
+        Scored(one_year_job, 75, "x", [], [], "unknown"), selection, cfg, now,
+    )
+    check("独立函数提取 1 年要求", _min_years_required(one_year_job.description), 1)
+    check("JD 要求 1 年可进入海投", one_year_decision.mode, "broad")
+    check("1 年要求理由可解释", "1 year" in one_year_decision.reason)
+    no_year_job = Job(
+        "seek", "Software Engineer", "NoYearsCo", "https://example.test/jobs/no-years",
+        description="Build customer-facing features with a supportive engineering team.",
+    )
+    no_year_decision = decide_application_mode(
+        Scored(no_year_job, 75, "x", [], [], "unknown"), selection, cfg, now,
+    )
+    check("JD 无年限要求默认放行", no_year_decision.mode, "broad")
+    check("无年限理由可解释", "未发现工作年限要求" in no_year_decision.reason)
+    graduate_job = Job(
+        "seek", "Software Engineer", "GraduateSignalCo", "https://example.test/jobs/graduate",
+        description="This role welcomes new graduate applicants.",
+    )
+    graduate_decision = decide_application_mode(
+        Scored(graduate_job, 75, "x", [], [], "unknown"), selection, cfg, now,
+    )
+    check("JD new graduate 信号放行", graduate_decision.mode, "broad")
+    check("new graduate 理由可解释", "new graduate" in graduate_decision.reason)
     check("三天内岗位新鲜度", freshness_bucket((now - timedelta(hours=60)).isoformat(), cfg, now), "within_3d")
     check("更早岗位新鲜度", freshness_bucket((now - timedelta(days=6)).isoformat(), cfg, now), "older")
     rules = "# Stable rules\n" + ("Use verified facts and return structured scores. " * 12)
