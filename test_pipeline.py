@@ -58,6 +58,11 @@ same_job_b = Job("linkedin", "Software Engineer", "StableCo Pty Ltd", "https://l
 check("canonical job_id 不含 URL", same_job_a.id, same_job_b.id)
 check("legacy URL-based ID 与新 ID 区分", legacy_job_id(same_job_a.company, same_job_a.title, same_job_a.url) != same_job_a.id, True)
 check("canonical_job_id 公开函数稳定", canonical_job_id("StableCo", "Software Engineer", "Melbourne VIC"), same_job_a.id)
+check(
+    "canonical job_id 忽略地点以合并跨来源重复",
+    canonical_job_id("StableCo", "Software Engineer", "Sydney NSW"),
+    canonical_job_id("StableCo", "Software Engineer", "Melbourne VIC"),
+)
 
 
 print("\n=== 去重 ===")

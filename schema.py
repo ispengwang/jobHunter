@@ -36,7 +36,7 @@ class Job:
 
     def __post_init__(self):
         if not self.id:
-            self.id = canonical_job_id(self.company, self.title, self.location)
+            self.id = canonical_job_id(self.company, self.title)
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -141,9 +141,25 @@ def _job_id_from_key(key: str) -> str:
     return hashlib.md5(key.encode("utf-8")).hexdigest()[:12]
 
 
-def canonical_job_id(company: Optional[str], title: Optional[str], location: Optional[str]) -> str:
-    """Return the stable cross-source identity for a job."""
-    key = f"{norm_company(company)}|{norm_title(title)}|{norm_location(location)}"
+def canonical_job_id(
+    company: Optional[str],
+    title: Optional[str],
+    location: Optional[str] = None,
+) -> str:
+    """Return the stable cross-source identity for a job.
+
+    Location is intentionally not part of this identity. The same company and
+    role may be reported with a blank location on one source and a detailed
+    Melbourne/Victoria location on another, so including it recreates duplicate
+    dashboard rows. This also means same-company/same-title roles in different
+    cities merge; the current search scope is Melbourne only, and this must be
+    reassessed before expanding to multiple cities.
+
+    ``location`` remains an optional compatibility argument for callers written
+    against WF-101; it is deliberately ignored.
+    """
+    del location
+    key = f"{norm_company(company)}|{norm_title(title)}"
     return _job_id_from_key(key)
 
 

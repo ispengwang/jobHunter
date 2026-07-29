@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Migrate JobHunter's URL-based job IDs to canonical cross-source IDs.
+"""Migrate JobHunter's prior job IDs to canonical cross-source IDs.
 
 The command is intentionally one-shot and conservative:
 
@@ -115,7 +115,7 @@ def _dashboard_transform(table: CsvTable) -> tuple[list[dict[str, str]], dict[st
     groups: dict[str, list[dict[str, str]]] = {}
     for original in table.rows:
         row = dict(original)
-        new_id = canonical_job_id(row.get("company"), row.get("title"), row.get("location"))
+        new_id = canonical_job_id(row.get("company"), row.get("title"))
         old_id = row.get("job_id", "")
         _add_mapping(mapping, old_id, new_id, conflicts)
         # Also map the old derived value in case a hand-edited row has a stale
@@ -216,7 +216,7 @@ def _backup_data(root: Path, requested: Path | None = None) -> Path:
     data_dir = root / "data"
     if not data_dir.is_dir():
         raise FileNotFoundError(f"找不到数据目录: {data_dir}")
-    backup = requested or root / f"data-backup-{datetime.now().date().isoformat()}"
+    backup = requested or root / f"data-backup-{datetime.now().date().isoformat()}-jobid-v3"
     if backup.exists():
         raise FileExistsError(f"备份目录已存在，为避免覆盖请指定 --backup-dir: {backup}")
     shutil.copytree(data_dir, backup)
