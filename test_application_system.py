@@ -10,7 +10,13 @@ import tempfile
 import yaml
 
 from application_policy import _min_years_required, decide_application_mode, freshness_bucket
-from application_attempts import ApplicationAttempts, platform_submission_mode
+from application_attempts import (
+    ApplicationAttempts,
+    configured_platform_limits,
+    platform_limit_key,
+    platform_submission_mode,
+    submitted_today_by_platform,
+)
 from candidate_profile import UNKNOWN, load_or_initialise, save_profile
 from dashboard import Dashboard
 from resume_catalog import choose_resume, ensure_default_manifest, load_catalog
@@ -300,8 +306,37 @@ try:
     check("Agent 自动创建内部执行记录", attempt["status"], "selected")
     check("选择记录不等于资料外发授权", attempt["data_transmission_confirmed"], "")
     check("SEEK 默认由 Skill 检查后决定是否自动", attempt["platform_mode"], "auto_if_allowed")
-    check("LinkedIn 默认手动提交", platform_submission_mode("linkedin"), "manual_submit")
-    check("Indeed 默认手动提交", platform_submission_mode("indeed"), "manual_submit")
+    check("LinkedIn 默认 assisted", platform_submission_mode("linkedin"), "assisted")
+    check("Indeed 默认 assisted", platform_submission_mode("indeed"), "assisted")
+    check(
+        "自定义 assisted host 生效",
+        platform_submission_mode(
+            "custom", "https://forms.example/jobs/1",
+            {"assisted_hosts": ["forms.example"], "manual_hosts": ["manual.example"]},
+        ),
+        "assisted",
+    )
+    check(
+        "自定义 manual host 生效",
+        platform_submission_mode(
+            "custom", "https://manual.example/jobs/1",
+            {"assisted_hosts": ["forms.example"], "manual_hosts": ["manual.example"]},
+        ),
+        "manual_submit",
+    )
+    check("LinkedIn Easy Apply 计入 LinkedIn 限额", platform_limit_key("linkedin", "https://www.linkedin.com/jobs/1"), "linkedin")
+    check("LinkedIn 外部 ATS 计入 external ATS 限额", platform_limit_key("linkedin", "https://boards.greenhouse.io/acme/1"), "external_ats")
+    check("默认平台限额", configured_platform_limits(), {"linkedin": 8, "indeed": 8, "external_ats": 40})
+    today_submission = datetime.now(timezone.utc).isoformat()
+    platform_counts = submitted_today_by_platform([
+        {"status": "submitted", "submission_evidence": "ok", "submitted_at": today_submission,
+         "source": "linkedin", "url": "https://www.linkedin.com/jobs/1"},
+        {"status": "submitted", "submission_evidence": "ok", "submitted_at": today_submission,
+         "source": "indeed", "url": "https://www.indeed.com/jobs/2"},
+        {"status": "submitted", "submission_evidence": "ok", "submitted_at": today_submission,
+         "source": "linkedin", "url": "https://boards.greenhouse.io/acme/3"},
+    ], "Australia/Melbourne")
+    check("已提交按平台分别计数", platform_counts, {"linkedin": 1, "indeed": 1, "external_ats": 1})
     check("Agent 选择后岗位进入待投递", dashboard.get(job.id)["status"], "ready_to_apply")
     duplicate = attempts.create(job.id, reloaded, profile_path)
     check("同一岗位不会重复创建活动交接", duplicate["attempt_id"], attempt["attempt_id"])
@@ -324,8 +359,8 @@ try:
             resume_path=str(selection.path), run_id="agent-run",
         )
     auto_selection = attempts.select_eligible(reloaded, profile_path, max_new=5)
-    check("Agent 自动选择 SEEK 可执行岗位", len(auto_selection["selected"]), 1)
-    check("LinkedIn 保留为平台手动模式", len(auto_selection["manual_only"]), 1)
+    check("Agent 自动选择 SEEK 可执行岗位和 LinkedIn assisted 岗位", len(auto_selection["selected"]), 2)
+    check("LinkedIn 不再落入 manual_only", len(auto_selection["manual_only"]), 0)
     check(
         "SEEK 原站默认手动操作",
         platform_submission_mode("seek", "https://www.seek.com.au/job/123"),
@@ -568,7 +603,7 @@ try:
             headers={"Accept": "application/json"},
         )
         manual_payload = manual_start.get_json()
-        check("加入清单保留平台模式", manual_payload["platform_mode"], "manual_submit")
+        check("加入清单保留 assisted 平台模式", manual_payload["platform_mode"], "assisted")
         check("加入清单不返回外部打开地址", "open_url" in manual_payload, False)
         linked_attempt = webapp._attempts(webapp.load_config()).get(manual_payload["attempt_id"])
         check("点击按钮不代表资料外发授权", linked_attempt["data_transmission_confirmed"], "")

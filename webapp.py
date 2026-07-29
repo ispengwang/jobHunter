@@ -43,7 +43,10 @@ from candidate_profile import (
 from dashboard import Dashboard, STATUSES
 from application_attempts import (
     ApplicationAttempts,
+    configured_platform_limits,
     platform_submission_mode,
+    platform_limit_key,
+    submitted_today_by_platform,
 )
 from application_policy import freshness_bucket
 from scrapers.seek_source import clean_seek_title
@@ -116,6 +119,7 @@ def _attempts(cfg) -> ApplicationAttempts:
         browser_enabled=bool(cfg.get("application", {}).get("browser_enabled", True)),
         skill_path=skill_path,
         project_root=ROOT,
+        platform_config=cfg.get("applypilot", {}),
     )
 
 
@@ -145,6 +149,7 @@ ATTEMPT_LABELS = {
 }
 PLATFORM_MODE_LABELS = {
     "manual_submit": "打开申请页，由你完成平台操作",
+    "assisted": "Agent 辅助填写，最终由你提交",
     "auto_if_allowed": "ApplyPilot 核验后可自动",
 }
 def _user_status(status: str) -> str:
@@ -341,7 +346,9 @@ def _unified_dashboard_rows(
             row.get("posted_at", ""), timezone_name
         )
         attempt = attempts_by_job.get(row.get("job_id", ""), {})
-        platform_mode = platform_submission_mode(row.get("source", ""), row.get("url", ""))
+        platform_mode = platform_submission_mode(
+            row.get("source", ""), row.get("url", ""), freshness_config,
+        )
         attempt_status = attempt.get("status", "")
         apply_button_label = "加入投递清单"
         apply_explanation = (
@@ -431,11 +438,12 @@ def _attempt_public_payload(
     attempt: dict[str, str],
     *,
     message: str = "",
+    platform_config: dict | None = None,
 ) -> dict[str, str | int | bool | None]:
     """Return browser-safe attempt state without local profile/resume paths."""
     status = attempt.get("status", "")
     platform_mode = platform_submission_mode(
-        attempt.get("platform", ""), attempt.get("url", "")
+        attempt.get("platform", ""), attempt.get("url", ""), platform_config,
     )
     return {
         "ok": True,
@@ -1687,15 +1695,21 @@ def queue_applypilot(job_id: str):
     service = _attempts(cfg)
     attempt: dict[str, str] | None = None
     try:
-        from run import submitted_today
-
         apply_cfg = cfg.get("applypilot", {})
         timezone_name = str(apply_cfg.get("timezone", "Australia/Melbourne"))
-        hard_cap = int(apply_cfg.get("hard_cap_per_day", 40))
-        confirmed_today = submitted_today(board.load_rows(), timezone_name)
-        if confirmed_today >= hard_cap:
+        counts = submitted_today_by_platform(board.load_rows(), timezone_name, apply_cfg)
+        limits = configured_platform_limits(apply_cfg)
+        target = board.get(job_id)
+        if target is None:
+            raise KeyError(f"Dashboard 中找不到岗位: {job_id}")
+        limit_key = platform_limit_key(
+            target.get("source", ""), target.get("url", ""), apply_cfg,
+        )
+        platform_limit = limits.get(limit_key)
+        if platform_limit is not None and counts.get(limit_key, 0) >= platform_limit:
             raise ValueError(
-                f"今天已经确认提交 {confirmed_today} 份，达到每日硬上限 {hard_cap}。"
+                f"今天 {limit_key} 已确认提交 {counts.get(limit_key, 0)} 份，"
+                f"达到该平台每日上限 {platform_limit}。"
             )
 
         profile_path, profile = _candidate_profile(cfg)
@@ -1707,14 +1721,18 @@ def queue_applypilot(job_id: str):
                     attempt["attempt_id"], "needs_user", actor="system", reason=reason,
                 )
             payload = _attempt_public_payload(
-                attempt, message=f"需要先补全 Candidate Profile：{reason}"
+                attempt,
+                message=f"需要先补全 Candidate Profile：{reason}",
+                platform_config=cfg,
             )
             if wants_json:
                 return jsonify(payload)
             return redirect(url_for("candidate_profile"))
 
         message = "已加入本地投递清单；当前 Agent 可运行 venv/bin/python run.py --handoff-list 读取。"
-        payload = _attempt_public_payload(attempt, message=message)
+        payload = _attempt_public_payload(
+            attempt, message=message, platform_config=cfg,
+        )
         if wants_json:
             return jsonify(payload)
         return redirect(url_for("dashboard_view", saved="1"))

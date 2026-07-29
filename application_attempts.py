@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from candidate_profile import CandidateProfile
 from dashboard import Dashboard
@@ -29,27 +30,131 @@ ATTEMPT_FIELDS = [
     "submission_evidence",
 ]
 
+DEFAULT_ASSISTED_HOSTS = ("linkedin.com", "indeed.com", "indeed.com.au")
+DEFAULT_MANUAL_HOSTS = ("seek.com.au", "au.seek.com")
+DEFAULT_PLATFORM_LIMITS = {"linkedin": 8, "indeed": 8, "external_ats": 40}
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def platform_submission_mode(platform: str, url: str = "") -> str:
-    """Return the conservative ApplyPilot default for the concrete URL.
+def _applypilot_config(config: dict | None) -> dict:
+    if not config:
+        return {}
+    nested = config.get("applypilot")
+    return nested if isinstance(nested, dict) else config
 
-    A direct employer/ATS URL can be checked for ``auto_if_allowed`` even when the lead originated
-    on a job board. On-platform LinkedIn, Indeed and SEEK flows remain manual by default.
+
+def _configured_hosts(config: dict | None, key: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    value = _applypilot_config(config).get(key, default)
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple, set)):
+        return default
+    return tuple(
+        str(item).strip().lower().removeprefix("www.")
+        for item in value if str(item).strip()
+    )
+
+
+def _host_matches(hostname: str, configured_hosts: tuple[str, ...]) -> bool:
+    return any(
+        hostname == host or hostname.endswith("." + host)
+        for host in configured_hosts
+    )
+
+
+def platform_submission_mode(
+    platform: str,
+    url: str = "",
+    config: dict | None = None,
+) -> str:
+    """Return the ApplyPilot interaction mode for the concrete URL.
+
+    ``assisted`` means the Agent may help fill and review the form, but must stop before the
+    final submit control so the user can click it. ``manual_submit`` leaves all platform steps
+    to the user. A direct employer/ATS URL is ``auto_if_allowed`` when it is not one of the
+    configured assisted/manual hosts; the skill's safety gates and final-submit rule still apply.
     """
     normalised = (platform or "").strip().lower()
     hostname = (urlparse(url).hostname or "").casefold()
-    manual_hosts = ("linkedin.com", "indeed.com", "indeed.com.au", "seek.com.au", "au.seek.com")
+    assisted_hosts = _configured_hosts(config, "assisted_hosts", DEFAULT_ASSISTED_HOSTS)
+    manual_hosts = _configured_hosts(config, "manual_hosts", DEFAULT_MANUAL_HOSTS)
     if hostname:
-        if any(hostname == host or hostname.endswith("." + host) for host in manual_hosts):
+        if _host_matches(hostname, assisted_hosts):
+            return "assisted"
+        if _host_matches(hostname, manual_hosts):
             return "manual_submit"
         return "auto_if_allowed"
-    if any(name in normalised for name in ("linkedin", "indeed", "seek")):
+    if "linkedin" in normalised or "indeed" in normalised:
+        return "assisted"
+    if "seek" in normalised:
         return "manual_submit"
     return "auto_if_allowed"
+
+
+def platform_limit_key(
+    platform: str,
+    url: str = "",
+    config: dict | None = None,
+) -> str:
+    """Return the daily-limit bucket for the actual submission destination."""
+    hostname = (urlparse(url).hostname or "").casefold()
+    normalised = (platform or "").strip().lower()
+    assisted_hosts = _configured_hosts(config, "assisted_hosts", DEFAULT_ASSISTED_HOSTS)
+    manual_hosts = _configured_hosts(config, "manual_hosts", DEFAULT_MANUAL_HOSTS)
+    if hostname and _host_matches(hostname, assisted_hosts):
+        return "indeed" if "indeed" in hostname else "linkedin"
+    if not hostname:
+        if "indeed" in normalised:
+            return "indeed"
+        if "linkedin" in normalised:
+            return "linkedin"
+    if hostname and _host_matches(hostname, manual_hosts):
+        return "external_ats"
+    return "external_ats"
+
+
+def configured_platform_limits(config: dict | None = None) -> dict[str, int]:
+    """Return positive per-destination limits, merged with safe defaults."""
+    limits = dict(DEFAULT_PLATFORM_LIMITS)
+    configured = _applypilot_config(config).get("platform_limits", {})
+    if isinstance(configured, dict):
+        for key, value in configured.items():
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed >= 0:
+                limits[str(key)] = parsed
+    return limits
+
+
+def submitted_today_by_platform(
+    rows: list[dict[str, str]],
+    timezone_name: str,
+    config: dict | None = None,
+) -> dict[str, int]:
+    """Count evidenced submissions for today by their actual destination bucket."""
+    zone = ZoneInfo(timezone_name)
+    today = datetime.now(zone).date()
+    counts = {key: 0 for key in configured_platform_limits(config)}
+    for row in rows:
+        if row.get("status") != "submitted" or not row.get("submission_evidence", "").strip():
+            continue
+        raw = row.get("submitted_at", "").strip().replace("Z", "+00:00")
+        try:
+            submitted_at = datetime.fromisoformat(raw)
+        except ValueError:
+            continue
+        if submitted_at.tzinfo is None:
+            submitted_at = submitted_at.replace(tzinfo=zone)
+        if submitted_at.astimezone(zone).date() != today:
+            continue
+        key = platform_limit_key(row.get("source", ""), row.get("url", ""), config)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 class ApplicationAttempts:
@@ -61,12 +166,14 @@ class ApplicationAttempts:
         browser_enabled: bool = True,
         skill_path: Path | None = None,
         project_root: Path | None = None,
+        platform_config: dict | None = None,
     ):
         self.path = path
         self.dashboard = dashboard
         self.browser_enabled = browser_enabled
         self.skill_path = skill_path
         self.project_root = project_root or path.parent.parent
+        self.platform_config = platform_config or {}
 
     def load_rows(self) -> list[dict[str, str]]:
         if not self.path.exists():
@@ -122,7 +229,9 @@ class ApplicationAttempts:
         artifact_path = Path(row.get("artifact_path", "")) if row.get("artifact_path") else None
         tailored_resume = artifact_path / "resume.md" if artifact_path else None
         resume_path = str(tailored_resume) if tailored_resume and tailored_resume.exists() else row.get("resume_path", "")
-        platform_mode = platform_submission_mode(row.get("source", ""), row.get("url", ""))
+        platform_mode = platform_submission_mode(
+            row.get("source", ""), row.get("url", ""), self.platform_config,
+        )
         attempt = {
             "attempt_id": uuid4().hex[:16], "job_id": job_id, "platform": row.get("source", ""),
             "url": row.get("url", ""), "company": row.get("company", ""),
@@ -155,11 +264,14 @@ class ApplicationAttempts:
         max_new: int,
         soft_max_new: int | None = None,
         actor: str = "agent",
+        platform_remaining: dict[str, int] | None = None,
     ) -> dict[str, list[dict[str, str]]]:
         """Select eligible jobs for the current Agent, prioritising postings from the last 24h.
 
-        ``max_new`` is the remaining hard-cap allowance. ``soft_max_new`` limits older jobs to
-        the normal daily target, while fresh jobs may use the remaining buffer up to the hard cap.
+        ``max_new`` is the remaining total allowance. ``platform_remaining`` optionally applies
+        per-destination limits after already evidenced submissions and active attempts are
+        accounted for. ``soft_max_new`` limits older jobs to the normal daily target, while fresh
+        jobs may use the remaining buffer up to the hard limit.
         """
         rows = self.dashboard.load_rows()
         attempts = self.load_rows()
@@ -184,34 +296,62 @@ class ApplicationAttempts:
             row.get("job_id", ""): self.dashboard.current_freshness(row)
             for row in rows
         }
+        def mode_priority(row: dict[str, str]) -> int:
+            mode = platform_submission_mode(
+                row.get("source", ""), row.get("url", ""), self.platform_config,
+            )
+            return 0 if mode == "auto_if_allowed" else 1 if mode == "assisted" else 2
+
         candidates.sort(key=lambda row: (
             freshness_order.get(current_freshness.get(row.get("job_id", ""), "unknown"), 9),
+            mode_priority(row),
             -_score(row.get("job_fit_score")),
             -_score(row.get("resume_fit_score")),
             row.get("title", "").casefold(),
         ))
 
-        automatic = [
+        agent_candidates = [
             row for row in candidates
-            if platform_submission_mode(row.get("source", ""), row.get("url", "")) == "auto_if_allowed"
+            if platform_submission_mode(
+                row.get("source", ""), row.get("url", ""), self.platform_config,
+            ) in {"auto_if_allowed", "assisted"}
         ]
         manual_only = [
             row for row in candidates
-            if platform_submission_mode(row.get("source", ""), row.get("url", "")) == "manual_submit"
+            if platform_submission_mode(
+                row.get("source", ""), row.get("url", ""), self.platform_config,
+            ) == "manual_submit"
         ]
         hard_slots = max(0, max_new)
         soft_slots = hard_slots if soft_max_new is None else min(hard_slots, max(0, soft_max_new))
-        priority_automatic = [
-            row for row in automatic
+        remaining = dict(platform_remaining) if platform_remaining is not None else None
+
+        def take(candidates_to_take: list[dict[str, str]], slots: int) -> list[dict[str, str]]:
+            selected_rows: list[dict[str, str]] = []
+            for row in candidates_to_take:
+                if len(selected_rows) >= slots:
+                    break
+                if remaining is not None:
+                    key = platform_limit_key(
+                        row.get("source", ""), row.get("url", ""), self.platform_config,
+                    )
+                    if remaining.get(key, 0) <= 0:
+                        continue
+                    remaining[key] -= 1
+                selected_rows.append(row)
+            return selected_rows
+
+        priority_agent = [
+            row for row in agent_candidates
             if current_freshness.get(row.get("job_id", ""), "unknown") == "within_24h"
         ]
-        standard_automatic = [
-            row for row in automatic
+        standard_agent = [
+            row for row in agent_candidates
             if current_freshness.get(row.get("job_id", ""), "unknown") != "within_24h"
         ]
-        selected_rows = priority_automatic[:hard_slots]
+        selected_rows = take(priority_agent, hard_slots)
         standard_slots = max(0, soft_slots - len(selected_rows))
-        selected_rows.extend(standard_automatic[:standard_slots])
+        selected_rows.extend(take(standard_agent, standard_slots))
         selected = [
             self.create(row["job_id"], profile, profile_path, actor=actor)
             for row in selected_rows
@@ -338,7 +478,9 @@ class ApplicationAttempts:
             "attempt_id": attempt["attempt_id"], "platform": attempt["platform"],
             "company": attempt["company"], "title": attempt["title"], "url": attempt["url"],
             "mode": attempt["mode"],
-            "platform_mode": platform_submission_mode(attempt["platform"], attempt["url"]),
+            "platform_mode": platform_submission_mode(
+                attempt["platform"], attempt["url"], self.platform_config,
+            ),
             "readiness": attempt.get("readiness", "unknown"),
             "job_fit_score": dashboard_row.get("job_fit_score", ""),
             "resume_fit_score": dashboard_row.get("resume_fit_score", ""),
@@ -353,9 +495,10 @@ class ApplicationAttempts:
                 "Continue this attempt now in the current Codex Agent. Use applypilot-au as the sole "
                 "submission policy and executor, validate readiness, and load its platform playbook "
                 "and safety gates. This internal selection record is not browser activity or a "
-                "submission. LinkedIn "
-                "and Indeed default to manual_submit. SEEK and external ATS may auto-submit only when "
-                "the skill's current permission and safety gates pass. Record explicit submission "
+                "submission. LinkedIn and Indeed use assisted mode: fill and review, then stop "
+                "before the final submit control so the user can click it. SEEK remains manual; "
+                "external ATS still requires the skill's current permission and safety gates, "
+                "and the user must click the final submit control. Record explicit submission "
                 "evidence before marking submitted."
             ),
         }
@@ -385,7 +528,9 @@ class ApplicationAttempts:
                 "title": attempt.get("title", ""),
                 "url": url,
                 "platform": platform,
-                "platform_mode": platform_submission_mode(platform, url),
+                "platform_mode": platform_submission_mode(
+                    platform, url, self.platform_config,
+                ),
                 "job_fit_score": row.get("job_fit_score", ""),
                 "resume_fit_score": row.get("resume_fit_score", ""),
                 "freshness": freshness,

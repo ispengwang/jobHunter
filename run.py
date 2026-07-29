@@ -207,23 +207,10 @@ def save_ranked_markdown(scored, path: Path) -> None:
 
 
 def submitted_today(rows: list[dict[str, str]], timezone_name: str) -> int:
-    """Count evidenced Dashboard submissions for the configured local calendar day."""
-    zone = ZoneInfo(timezone_name)
-    today = datetime.now(zone).date()
-    count = 0
-    for row in rows:
-        if row.get("status") != "submitted" or not row.get("submission_evidence", "").strip():
-            continue
-        raw = row.get("submitted_at", "").strip().replace("Z", "+00:00")
-        try:
-            submitted_at = datetime.fromisoformat(raw)
-        except ValueError:
-            continue
-        if submitted_at.tzinfo is None:
-            submitted_at = submitted_at.replace(tzinfo=zone)
-        if submitted_at.astimezone(zone).date() == today:
-            count += 1
-    return count
+    """Count evidenced submissions for compatibility with older callers."""
+    from application_attempts import submitted_today_by_platform
+
+    return sum(submitted_today_by_platform(rows, timezone_name).values())
 
 
 def main() -> None:
@@ -284,6 +271,7 @@ def main() -> None:
             browser_enabled=bool(cfg.get("application", {}).get("browser_enabled", True)),
             skill_path=project_path(configured_skill) if configured_skill else None,
             project_root=ROOT,
+            platform_config=cfg.get("applypilot", {}),
         )
         if args.handoff_list:
             result = attempts.handoff_list()
@@ -453,15 +441,22 @@ def main() -> None:
     if args.autopilot:
         # JobHunter prepares deterministic execution records. The current Codex Agent consumes
         # this manifest immediately under applypilot-au; no Dashboard click or copied prompt exists.
-        from application_attempts import ApplicationAttempts
+        from application_attempts import (
+            ApplicationAttempts,
+            configured_platform_limits,
+            platform_limit_key,
+            submitted_today_by_platform,
+        )
 
         apply_cfg = cfg.get("applypilot", {})
         timezone_name = str(apply_cfg.get("timezone", "Australia/Melbourne"))
         soft_target = int(apply_cfg.get("soft_target_per_day", 30))
-        hard_cap = int(apply_cfg.get("hard_cap_per_day", 40))
         audit_batch = int(apply_cfg.get("audit_batch_size", 5))
         auto_submit_enabled = bool(apply_cfg.get("auto_submit_enabled", False))
-        confirmed_today = submitted_today(dashboard.load_rows(), timezone_name)
+        platform_limits = configured_platform_limits(apply_cfg)
+        platform_counts = submitted_today_by_platform(
+            dashboard.load_rows(), timezone_name, apply_cfg,
+        )
 
         configured_skill = apply_cfg.get("skill_path", "")
         attempts = ApplicationAttempts(
@@ -470,6 +465,7 @@ def main() -> None:
             browser_enabled=bool(cfg.get("application", {}).get("browser_enabled", True)),
             skill_path=project_path(configured_skill) if configured_skill else None,
             project_root=ROOT,
+            platform_config=apply_cfg,
         )
         existing_runnable = [
             row for row in attempts.load_rows()
@@ -477,13 +473,30 @@ def main() -> None:
                 "selected", "queued", "browser_opened", "filling", "ready_to_submit",
             }
         ]
-        hard_remaining = max(0, hard_cap - confirmed_today)
-        soft_remaining = max(0, min(soft_target, hard_cap) - confirmed_today)
-        max_new = max(0, hard_remaining - len(existing_runnable)) if auto_submit_enabled else 0
-        soft_max_new = max(0, soft_remaining - len(existing_runnable))
+        existing_platform_counts: dict[str, int] = {}
+        for row in existing_runnable:
+            key = platform_limit_key(row.get("platform", ""), row.get("url", ""), apply_cfg)
+            existing_platform_counts[key] = existing_platform_counts.get(key, 0) + 1
+        platform_remaining = {
+            key: max(
+                0,
+                limit - platform_counts.get(key, 0) - existing_platform_counts.get(key, 0),
+            )
+            for key, limit in platform_limits.items()
+        }
+        confirmed_today = sum(platform_counts.values())
+        hard_remaining = sum(platform_remaining.values())
+        soft_remaining = max(
+            0,
+            min(soft_target, sum(platform_limits.values()))
+            - confirmed_today - len(existing_runnable),
+        )
+        max_new = hard_remaining if auto_submit_enabled else 0
+        soft_max_new = max(0, min(max_new, soft_remaining))
         selection = attempts.select_eligible(
             candidate, candidate_path, max_new=max_new,
             soft_max_new=soft_max_new, actor="agent",
+            platform_remaining=platform_remaining,
         )
         payloads = [
             attempts.handoff_payload(row["attempt_id"])
@@ -504,9 +517,13 @@ def main() -> None:
             "new_execution_records": len(selection["selected"]),
             "priority_24h_execution_records": len(selection["priority_selected"]),
             "manual_platform_jobs": len(selection["manual_only"]),
+            "assisted_platform_jobs": sum(
+                1 for item in payloads if item.get("platform_mode") == "assisted"
+            ),
             "automation_policy": {
                 "mode": str(apply_cfg.get("automation_mode", "light")),
                 "auto_submit_enabled": auto_submit_enabled,
+                "final_submit_requires_user": True,
                 "priority_within_hours": int(
                     cfg.get("application", {}).get("priority_within_hours", 24)
                 ),
@@ -519,8 +536,10 @@ def main() -> None:
                 "timezone": timezone_name,
                 "confirmed_today": confirmed_today,
                 "soft_target": soft_target,
-                "hard_cap": hard_cap,
-                "remaining_before_hard_cap": max(0, hard_cap - confirmed_today),
+                "platform_limits": platform_limits,
+                "platform_counts": platform_counts,
+                "platform_remaining": platform_remaining,
+                "remaining_before_platform_limits": hard_remaining,
                 "audit_batch_size": audit_batch,
             },
             "attempts": payloads,
@@ -528,6 +547,7 @@ def main() -> None:
                 "Continue these attempts now in score order with the installed applypilot-au skill. "
                 "Process jobs posted within 24 hours first, then continue by score in audit batches. "
                 "Write every outcome through run.py --attempt-update, "
+                "stop before the final submit control so the user can click it, "
                 "and do not ask the user to click Dashboard buttons or copy prompts."
             ),
         }

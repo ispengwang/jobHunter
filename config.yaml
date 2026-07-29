@@ -95,13 +95,19 @@ applypilot:
   # 当前 Codex Agent 加载此 Skill 后连续完成搜索、评分、Dashboard 同步和允许的投递。
   skill_path: "/Users/pengwang/.codex/skills/applypilot-au"
   autonomous: true
-  # 轻度自动投递：LinkedIn / Indeed / SEEK 原站默认由用户完成平台操作。
-  # 直接外部 ATS 只有在当前规则允许且所有安全门通过时，才交给 Agent 自动提交。
+  # 平台落点可配置：LinkedIn / Indeed 由 Agent 辅助填写，最终提交始终由用户点击。
+  assisted_hosts: [linkedin.com, indeed.com, indeed.com.au]
+  # SEEK 原站仍由用户完成平台步骤；未列出的雇主 ATS 走 auto_if_allowed 安全门。
+  manual_hosts: [seek.com.au, au.seek.com]
   automation_mode: "light"
   auto_submit_enabled: true
+  final_submit_requires_user: true
   timezone: "Australia/Melbourne"
   soft_target_per_day: 30
-  hard_cap_per_day: 40
+  platform_limits:
+    linkedin: 8
+    indeed: 8
+    external_ats: 40
   audit_batch_size: 5
 
 application:
