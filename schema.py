@@ -36,8 +36,7 @@ class Job:
 
     def __post_init__(self):
         if not self.id:
-            key = f"{norm_company(self.company)}|{norm_title(self.title)}|{self.url}"
-            self.id = hashlib.md5(key.encode()).hexdigest()[:12]
+            self.id = canonical_job_id(self.company, self.title, self.location)
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -85,14 +84,28 @@ _TITLE_NOISE = re.compile(
     r"apply now|full[\s-]?time|part[\s-]?time|permanent|contract)\b",
     re.I,
 )
+_TITLE_ANNOTATION = re.compile(r"[\(\[]([^\)\]]+)[\)\]]")
+_LOCATION_ANNOTATION = re.compile(
+    r"\b(?:sydney|melbourne|brisbane|perth|adelaide|canberra|hobart|darwin|"
+    r"vic|nsw|qld|wa|sa|act|tas|nt|australia|au|remote|hybrid|onsite|"
+    r"req(?:uisition)?|ref(?:erence)?|job|id)\b|\d",
+    re.I,
+)
+
+
+def _title_annotation(match: re.Match[str]) -> str:
+    """Drop location/reference annotations but keep role differentiators."""
+    content = match.group(1).strip()
+    return " " if _LOCATION_ANNOTATION.search(content) else f" {content} "
 
 
 def norm_title(title: Optional[str]) -> str:
     if not title:
         return ""
     s = title.lower()
-    # 去掉括号内容,通常是地点或 req 编号
-    s = re.sub(r"[\(\[].*?[\)\]]", " ", s)
+    # 去掉地点/req 编号括号,保留 "(Back End)"、"(Model Training)" 这类
+    # 能区分同一公司不同岗位的角色限定词。
+    s = _TITLE_ANNOTATION.sub(_title_annotation, s)
     s = _TITLE_NOISE.sub(" ", s)
     s = _PUNCT.sub(" ", s)
     # 常见同义词归一
@@ -110,7 +123,7 @@ def norm_location(loc: Optional[str]) -> str:
     if not loc:
         return ""
     s = loc.lower()
-    s = re.sub(r"\baustralia\b", " ", s)
+    s = re.sub(r"\b(?:australia|au)\b", " ", s)
     s = _PUNCT.sub(" ", s)
     # 州名归一
     for full, abbr in [
@@ -122,6 +135,22 @@ def norm_location(loc: Optional[str]) -> str:
     ]:
         s = s.replace(full, abbr)
     return _WS.sub(" ", s).strip()
+
+
+def _job_id_from_key(key: str) -> str:
+    return hashlib.md5(key.encode("utf-8")).hexdigest()[:12]
+
+
+def canonical_job_id(company: Optional[str], title: Optional[str], location: Optional[str]) -> str:
+    """Return the stable cross-source identity for a job."""
+    key = f"{norm_company(company)}|{norm_title(title)}|{norm_location(location)}"
+    return _job_id_from_key(key)
+
+
+def legacy_job_id(company: Optional[str], title: Optional[str], url: Optional[str]) -> str:
+    """Return the pre-WF-101 URL-based identity for migration tooling."""
+    key = f"{norm_company(company)}|{norm_title(title)}|{url or ''}"
+    return _job_id_from_key(key)
 
 
 # ---------------------------------------------------------------- 薪资解析

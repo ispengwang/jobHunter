@@ -123,7 +123,9 @@ def load_jobs(path: Path) -> list[Job]:
                 posted_date=row.get("posted_date") or None,
                 description=row.get("description") or "",
                 duplicate_urls=[u for u in (row.get("duplicate_urls") or "").split("; ") if u],
-                id=row.get("id") or "",
+                # Recompute IDs so an old URL-based jobs-raw.csv is upgraded
+                # in memory when --from-cache is used after WF-101.
+                id="",
             ))
     return jobs
 

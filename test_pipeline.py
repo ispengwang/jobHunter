@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from schema import Job, parse_salary, norm_company, norm_title
+from schema import Job, canonical_job_id, legacy_job_id, parse_salary, norm_company, norm_title
 from dedupe import dedupe
 from score import visa_filter, sponsorship_signal
 from run import prepare_scraped_jobs, load_jobs, save_jobs
@@ -48,9 +48,16 @@ print("\n=== 字段归一化 ===")
 check("norm_company 去后缀", norm_company("Atlassian Pty Ltd"), "atlassian")
 check("norm_company 大小写", norm_company("CANVA AUSTRALIA"), "canva")
 check("norm_title 去括号", norm_title("Senior Backend Engineer (Sydney)"), "senior backend engineer")
+check("norm_title 保留角色限定", norm_title("Software Engineer (Full stack)"), "software engineer full stack")
 check("norm_title 缩写", norm_title("Snr Backend Dev"), "senior backend engineer")
 check("norm_title dev=engineer", norm_title("Backend Developer"), "backend engineer")
 check("norm_title 噪音词", norm_title("Backend Engineer - URGENT - Full Time"), "backend engineer")
+
+same_job_a = Job("seek", "Software Engineer", "StableCo", "https://seek.example/1", location="Melbourne VIC")
+same_job_b = Job("linkedin", "Software Engineer", "StableCo Pty Ltd", "https://linkedin.example/2", location="Melbourne, Victoria, Australia")
+check("canonical job_id 不含 URL", same_job_a.id, same_job_b.id)
+check("legacy URL-based ID 与新 ID 区分", legacy_job_id(same_job_a.company, same_job_a.title, same_job_a.url) != same_job_a.id, True)
+check("canonical_job_id 公开函数稳定", canonical_job_id("StableCo", "Software Engineer", "Melbourne VIC"), same_job_a.id)
 
 
 print("\n=== 去重 ===")
