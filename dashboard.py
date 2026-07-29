@@ -19,7 +19,7 @@ REASON_REQUIRED = {"skipped", "blocked", "needs_user"}
 
 DASHBOARD_FIELDS = [
     "job_id", "company", "title", "source", "url", "duplicate_urls", "location",
-    "posted_at", "discovered_at", "job_fit_score", "job_fit_reason", "job_summary", "match_score",
+    "posted_at", "discovered_at", "first_seen_at", "job_fit_score", "job_fit_reason", "job_summary", "match_score",
     "resume_id", "resume_path", "resume_fit_score", "resume_reason", "application_mode",
     "freshness_bucket", "sponsorship_signal", "status", "skip_reason",
     "blocked_reason", "needs_user_reason", "submitted_at", "submission_evidence",
@@ -58,7 +58,31 @@ class Dashboard:
         """Return the bucket for the current clock, not the bucket from an old run."""
         if self.freshness_config is None:
             return row.get("freshness_bucket") or "unknown"
-        return freshness_bucket(row.get("posted_at"), self.freshness_config, now)
+        return freshness_bucket(
+            row.get("posted_at"), self.freshness_config, now,
+            first_seen_at=row.get("first_seen_at"),
+        )
+
+    def sync_existing_jobs(self, jobs: Iterable[Job], run_id: str = "") -> int:
+        """Touch only jobs already in the Dashboard, without rescoring or changing status."""
+        job_ids = {job.id for job in jobs}
+        if not job_ids:
+            return 0
+        rows = self.load_rows()
+        now = utc_now()
+        touched = 0
+        for row in rows:
+            if row.get("job_id") not in job_ids:
+                continue
+            if not row.get("first_seen_at"):
+                row["first_seen_at"] = row.get("discovered_at") or now
+            row["last_synced_at"] = now
+            if run_id:
+                row["last_run_id"] = run_id
+            touched += 1
+        if touched:
+            self._write_rows(rows)
+        return touched
 
     def _write_rows(self, rows: Iterable[dict[str, Any]]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -124,12 +148,14 @@ class Dashboard:
         base.update(external)
         if new_row:
             base.update({
-                "discovered_at": now, "status": "review", "skip_reason": "", "blocked_reason": "",
+                "discovered_at": now, "first_seen_at": now, "status": "review", "skip_reason": "", "blocked_reason": "",
                 "needs_user_reason": "", "submitted_at": "", "submission_evidence": "",
                 "next_action": "Review recommendation", "last_action": "discovered", "notes": "",
                 "artifact_path": artifact_path,
             })
-        elif artifact_path:
+        elif not base.get("first_seen_at"):
+            base["first_seen_at"] = base.get("discovered_at") or now
+        if not new_row and artifact_path:
             base["artifact_path"] = artifact_path
         by_id[job.id] = base
         self._write_rows(by_id.values())

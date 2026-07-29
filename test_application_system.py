@@ -177,6 +177,22 @@ try:
     check("单变体只凭 job-fit 进入 targeted", single_variant_decision.mode, "targeted")
     check("三天内岗位新鲜度", freshness_bucket((now - timedelta(hours=60)).isoformat(), cfg, now), "within_3d")
     check("更早岗位新鲜度", freshness_bucket((now - timedelta(days=6)).isoformat(), cfg, now), "older")
+    check(
+        "日期精度不足时用 first_seen_at 判断新鲜度",
+        freshness_bucket(
+            now.date().isoformat(), cfg, now,
+            first_seen_at=(now - timedelta(hours=2)).isoformat(),
+        ),
+        "within_24h",
+    )
+    check(
+        "无效发布时间也回退到 first_seen_at",
+        freshness_bucket(
+            "not-a-timestamp", cfg, now,
+            first_seen_at=(now - timedelta(hours=2)).isoformat(),
+        ),
+        "within_24h",
+    )
     rules = "# Stable rules\n" + ("Use verified facts and return structured scores. " * 12)
     deepseek_input = build_scoring_input(
         rules, preferences=prefs, candidate_context=reloaded.matching_context(), cfg=cfg,
@@ -294,6 +310,17 @@ try:
         resume_path=str(selection.path),
     )
     check("首次推荐进入 review", row["status"], "review")
+    check("首次推荐记录 first_seen_at", bool(row["first_seen_at"]), True)
+    before_sync = dict(row)
+    event_count = len(dashboard.events_for(job.id))
+    touched = dashboard.sync_existing_jobs([job], run_id="incremental-1")
+    after_sync = dashboard.get(job.id)
+    check("增量同步命中已有岗位", touched, 1)
+    check("旧岗位增量不改评分", after_sync["job_fit_score"], before_sync["job_fit_score"])
+    check("旧岗位增量不改状态", after_sync["status"], before_sync["status"])
+    check("旧岗位保留首次发现时间", after_sync["first_seen_at"], before_sync["first_seen_at"])
+    check("旧岗位记录同步运行 ID", after_sync["last_run_id"], "incremental-1")
+    check("旧岗位增量不新增事件", len(dashboard.events_for(job.id)), event_count)
     skill_path = root / "applypilot-au"
     (skill_path / "references").mkdir(parents=True)
     (skill_path / "SKILL.md").write_text("---\nname: applypilot-au\ndescription: test\n---\n", encoding="utf-8")

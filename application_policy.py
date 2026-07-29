@@ -60,11 +60,32 @@ def _min_years_required(description: str) -> int | None:
     return min((years for years, _ in requirements), default=None)
 
 
-def freshness_bucket(posted_at: str | None, cfg: dict, now: datetime | None = None) -> str:
-    if not posted_at:
+def freshness_bucket(
+    posted_at: str | None,
+    cfg: dict,
+    now: datetime | None = None,
+    *,
+    first_seen_at: str | None = None,
+) -> str:
+    """Classify freshness, using first discovery when a source only gives a date.
+
+    A date-only ``posted_at`` is not precise enough for the 24-hour queue. In that case the
+    dashboard's ``first_seen_at`` is the honest fallback; the UI labels it as first discovered,
+    never as the posting time.
+    """
+    raw_posted = str(posted_at or "").strip()
+    effective = first_seen_at
+    if raw_posted and len(raw_posted) > 10:
+        try:
+            datetime.fromisoformat(raw_posted.replace("Z", "+00:00"))
+        except ValueError:
+            pass
+        else:
+            effective = posted_at
+    if not effective:
         return "unknown"
     try:
-        raw = str(posted_at).strip().replace("Z", "+00:00")
+        raw = str(effective).strip().replace("Z", "+00:00")
         when = datetime.fromisoformat(raw)
         if when.tzinfo is None:
             when = when.replace(tzinfo=timezone.utc)
@@ -84,12 +105,15 @@ def freshness_bucket(posted_at: str | None, cfg: dict, now: datetime | None = No
 
 def decide_application_mode(scored: Scored, resume: ResumeSelection, cfg: dict,
                             now: datetime | None = None,
-                            variant_count: int | None = None) -> ApplicationDecision:
+                            variant_count: int | None = None,
+                            first_seen_at: str | None = None) -> ApplicationDecision:
     app_cfg = cfg.get("application", {})
     title = (scored.job.title or "").casefold()
     excluded = [str(x).casefold() for x in app_cfg.get("excluded_seniority_keywords", [])]
     eligible = [str(x).casefold() for x in app_cfg.get("eligible_seniority_keywords", [])]
-    freshness = freshness_bucket(scored.job.posted_date, cfg, now)
+    freshness = freshness_bucket(
+        scored.job.posted_date, cfg, now, first_seen_at=first_seen_at,
+    )
 
     excluded_hit = next((word for word in excluded if word and word in title), None)
     if excluded_hit:
@@ -153,17 +177,22 @@ def decide_application_mode(scored: Scored, resume: ResumeSelection, cfg: dict,
 
 
 def enrich_scored_jobs(scored_jobs: list[Scored], variants, root, cfg: dict,
-                       now: datetime | None = None) -> list[Scored]:
+                       now: datetime | None = None,
+                       first_seen_at: str | None = None,
+                       first_seen_at_by_job: dict[str, str] | None = None) -> list[Scored]:
     """Attach resume selection and workflow policy to already LLM-scored jobs."""
     for scored in scored_jobs:
+        seen_at = (first_seen_at_by_job or {}).get(scored.job.id) or first_seen_at
         if scored.score < 0:
             scored.application_mode = "manual_review"
             scored.eligibility_reason = "DeepSeek 打分失败，需人工判断"
-            scored.freshness_bucket = freshness_bucket(scored.job.posted_date, cfg, now)
+            scored.freshness_bucket = freshness_bucket(
+                scored.job.posted_date, cfg, now, first_seen_at=seen_at,
+            )
             continue
         selection = choose_resume(scored.job, variants, root)
         decision = decide_application_mode(
-            scored, selection, cfg, now, variant_count=len(variants)
+            scored, selection, cfg, now, variant_count=len(variants), first_seen_at=seen_at
         )
         scored.resume_id = selection.resume_id
         scored.resume_path = str(selection.path)

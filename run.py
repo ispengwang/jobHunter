@@ -13,18 +13,20 @@
   python run.py --limit 20         # 只处理前 N 个,首次试跑用
   python run.py --autopilot        # 搜索、DeepSeek 打分、同步并交给当前 Agent 继续投递
   python run.py --handoff-list     # 输出当前已选/排队的本地投递清单
+  python run.py --rescore-all      # 评分规则变更后强制重打全部岗位
+  python run.py --incremental      # 定时增量抓取，使用 48 小时窗口
   python run.py --attempt-handoff ID
 """
 from __future__ import annotations
 
 import argparse
 import csv
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 import logging
+import re
 import sys
-from zoneinfo import ZoneInfo
 from uuid import uuid4
 from pathlib import Path
 
@@ -100,14 +102,65 @@ def save_jobs(jobs: list[Job], path: Path) -> None:
     log.info("已写入 %s (%d 条)", path, len(jobs))
 
 
+_JUNIOR_SIGNAL = re.compile(
+    r"\b(graduate|new\s+grad|entry[- ]level|junior|jnr|associate)\b", re.I,
+)
+
+
+def _posted_sort_value(job: Job) -> float:
+    raw = (job.posted_date or "").strip().replace("Z", "+00:00")
+    if not raw:
+        return float("-inf")
+    try:
+        when = datetime.fromisoformat(raw)
+    except ValueError:
+        return float("-inf")
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when.timestamp()
+
+
+def representative_sample(jobs: list[Job], limit: int | None) -> list[Job]:
+    """Take a fresh, representative sample after dedupe instead of fetch-order rows.
+
+    A junior slice is reserved because junior terms are intentionally later in the configured
+    search list. The rest is newest-first; ties retain the original deterministic order.
+    """
+    if not limit or limit >= len(jobs):
+        return list(jobs)
+    ordered = sorted(
+        enumerate(jobs),
+        key=lambda pair: (-_posted_sort_value(pair[1]), pair[0]),
+    )
+    junior = [pair for pair in ordered if _JUNIOR_SIGNAL.search(
+        f"{pair[1].title} {pair[1].description[:500]}"
+    )]
+    junior_quota = min(len(junior), max(1, limit // 4))
+    selected = [job for _, job in junior[:junior_quota]]
+    selected_ids = {id(job) for job in selected}
+    selected.extend(job for _, job in ordered if id(job) not in selected_ids)
+    return selected[:limit]
+
+
 def prepare_scraped_jobs(jobs: list[Job], cache_path: Path, limit: int | None = None) -> list[Job]:
-    """Persist a complete scrape, or narrow only this run when ``--limit`` is set."""
+    """Persist the complete scrape; a limit is applied later to the deduped/filtered sample."""
     if limit:
-        limited = jobs[:limit]
-        log.info("--limit 生效,本次只处理 %d 条；保持主缓存不变: %s", len(limited), cache_path)
-        return limited
+        log.info("--limit=%d 延后到去重和签证过滤后按代表性抽样；保持主抓取缓存不变: %s", limit, cache_path)
+        return jobs
     save_jobs(jobs, cache_path)
     return jobs
+
+
+def jobs_to_score(
+    jobs: list[Job],
+    existing_job_ids: set[str],
+    *,
+    rescore_all: bool = False,
+) -> list[Job]:
+    """Return only unseen jobs unless a rules-change run explicitly requests a full rescore."""
+    if rescore_all:
+        return list(jobs)
+    return [job for job in jobs if job.id not in existing_job_ids]
 
 
 def load_jobs(path: Path) -> list[Job]:
@@ -230,6 +283,14 @@ def main() -> None:
         "--handoff-list", action="store_true",
         help="输出 selected/queued 投递记录的本地 Agent handoff 清单，然后退出",
     )
+    ap.add_argument(
+        "--rescore-all", action="store_true",
+        help="忽略 Dashboard 中的现有 job_id，强制重新评分全部岗位",
+    )
+    ap.add_argument(
+        "--incremental", action="store_true",
+        help="增量抓取模式，将 hours_old 收窄为 48 小时",
+    )
     ap.add_argument("--attempt-handoff",
                     help="打印某条 Agent 内部执行记录的无敏感信息说明，然后退出")
     ap.add_argument("--attempt-update",
@@ -243,11 +304,15 @@ def main() -> None:
     ap.add_argument("--submission-confirmed", action="store_true",
                     help="确认外部平台已明确显示提交成功")
     ap.add_argument("--limit", type=int,
-                     help="只处理前 N 个岗位。抓取时每个搜索词也收窄到约 N 条,少抓、"
-                          "少调详情接口,搜索和打分都更快。试跑/日常快速刷新用。")
+                     help="去重和签证过滤后按新鲜度抽取 N 个代表性岗位。试跑/日常快速刷新用。")
     args = ap.parse_args()
 
     cfg = load_cfg(ROOT / args.config)
+    if args.incremental:
+        if args.from_cache:
+            ap.error("--incremental 需要重新抓取，不能与 --from-cache 同时使用")
+        cfg.setdefault("search", {})["hours_old"] = 48
+        log.info("增量抓取模式：hours_old=48（Indeed 仍按 date_posted 本地过滤）")
     if args.autopilot and args.scrape_only:
         ap.error("--autopilot 不能与 --scrape-only 同时使用")
     if args.autopilot and cfg.get("llm", {}).get("provider", "").lower() != "deepseek":
@@ -293,15 +358,6 @@ def main() -> None:
     out_dir = project_path(cfg["paths"]["output_dir"])
     cache_path = out_dir / CACHE
 
-    # --limit:抓取阶段收窄每个搜索词的抓取量(少抓、少调 SEEK 详情接口 → 搜索更快)。
-    # 打分阶段再把总数截到 N。两头都提速,适合"只要前 N 个、快速看一眼"。
-    if args.limit and not args.from_cache:
-        orig = cfg["search"].get("results_per_term", 50)
-        narrowed = min(orig, args.limit)
-        if narrowed < orig:
-            cfg["search"]["results_per_term"] = narrowed
-            log.info("--limit=%d:每个搜索词抓取量 %d → %d,加快搜索", args.limit, orig, narrowed)
-
     # ---- 1. 抓取
     if args.from_cache:
         if not cache_path.exists():
@@ -331,14 +387,42 @@ def main() -> None:
         log.info("被签证条件淘汰的岗位已单独存档,建议扫一眼确认没误杀")
 
     if args.limit:
-        jobs = jobs[:args.limit]
-        log.info("--limit 生效,只处理 %d 条", len(jobs))
+        jobs = representative_sample(jobs, args.limit)
+        log.info("--limit 生效,去重/签证过滤后按新鲜度和 junior 代表性抽取 %d 条", len(jobs))
 
     if not jobs:
         log.error("过滤后没有剩余岗位。config.yaml 的 exclude_keywords 可能过严。")
         sys.exit(1)
 
-    # ---- 4. LLM 打分
+    from dashboard import Dashboard
+    dashboard = Dashboard(
+        project_path(cfg["paths"].get("dashboard", "data/application-dashboard.csv")),
+        project_path(cfg["paths"].get("application_events", "data/application-events.csv")),
+        freshness_config=cfg,
+    )
+    run_id = uuid4().hex[:12]
+    dashboard_rows = dashboard.load_rows()
+    existing_job_ids = {row.get("job_id", "") for row in dashboard_rows if row.get("job_id")}
+    first_seen_at_by_job = {
+        row.get("job_id", ""): row.get("first_seen_at") or row.get("discovered_at", "")
+        for row in dashboard_rows if row.get("job_id")
+    }
+    sync_timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    jobs_for_scoring = jobs_to_score(
+        jobs, existing_job_ids, rescore_all=args.rescore_all,
+    )
+    existing_jobs = [job for job in jobs if job.id in existing_job_ids]
+    touched = dashboard.sync_existing_jobs(existing_jobs, run_id=run_id)
+    if not args.rescore_all:
+        log.info(
+            "增量打分：%d 条岗位中 %d 条已有记录仅更新 last_synced_at，%d 条新岗位进入 DeepSeek",
+            len(jobs), touched, len(jobs_for_scoring),
+        )
+    if not jobs_for_scoring:
+        print("本轮没有新岗位需要 DeepSeek 打分；已有岗位只更新了同步时间。")
+        return
+
+    # ---- 4. LLM 打分（增量模式只处理 jobs_for_scoring）
     resume, prefs = read_profile(cfg)
     from candidate_profile import load_or_initialise
     from resume_catalog import ensure_default_manifest, load_catalog
@@ -373,17 +457,14 @@ def main() -> None:
     )
     scoring_rules_hash = hashlib.sha256(scoring_rules.encode("utf-8")).hexdigest()[:12]
     log.info("DeepSeek 使用 Skill 固定评分规则: %s (sha256:%s)", scoring_rules_path, scoring_rules_hash)
-    scored = score_jobs(jobs, llm, resume, scoring_policy, cfg["visa"])
+    scored = score_jobs(jobs_for_scoring, llm, resume, scoring_policy, cfg["visa"])
     from application_policy import enrich_scored_jobs
-    scored = enrich_scored_jobs(scored, variants, ROOT, cfg)
-
-    from dashboard import Dashboard
-    dashboard = Dashboard(
-        project_path(cfg["paths"].get("dashboard", "data/application-dashboard.csv")),
-        project_path(cfg["paths"].get("application_events", "data/application-events.csv")),
-        freshness_config=cfg,
+    scored = enrich_scored_jobs(
+        scored, variants, ROOT, cfg,
+        first_seen_at=sync_timestamp,
+        first_seen_at_by_job=first_seen_at_by_job,
     )
-    run_id = uuid4().hex[:12]
+
     for s in scored:
         dashboard.upsert_recommendation(
             s.job, job_fit_score=s.score, job_fit_reason=s.reason,

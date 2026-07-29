@@ -115,11 +115,34 @@ output/applications/
 
 `00-summary.md` 里有投递链接和一个 checklist。**每一份都要自己读一遍**，重点确认简历里没有被 AI 润色出来的、你其实没做过的事。使用完整 Agent 流程时，这些材料会被内部执行记录引用，不需要手动加入队列。
 
-完整流程仍可直接在 Codex 调用 `applypilot-au`；如果只想投某一个岗位，则在 `/dashboard` 点击对应卡片的按钮。按钮不会生成需要你操作的 ApplyPilot 队列，也不需要复制启动提示词。真实投递仍以 Skill 的平台模式、自动投递门槛、每日限额和提交证据规则为准。详见 [BROWSER_APPLICATION_RUNBOOK.md](BROWSER_APPLICATION_RUNBOOK.md)。
+完整流程仍可直接在 Codex 调用 `applypilot-au`；如果只想投某一个岗位，则在 `/dashboard` 点击对应卡片的按钮。按钮只会加入本地投递清单，不启动后台进程；当前 Agent 用 `venv/bin/python run.py --handoff-list` 读取。真实投递仍以 Skill 的平台模式、平台限额和提交证据规则为准。详见 [BROWSER_APPLICATION_RUNBOOK.md](BROWSER_APPLICATION_RUNBOOK.md)。
 
 Markdown 转 PDF 最简单的办法是用 VS Code 装 "Markdown PDF" 插件，或者直接复制粘贴到 Word 里排版。
 
-## 之后每周重新跑
+## 定时抓取（准备好后再由用户安装）
+
+仓库提供两个 macOS `launchd` User Agent 模板：
+
+- `launchd/au.jobhunter.incremental.plist.template`：每 3 小时运行一次 `--incremental`，使用 48 小时窗口；
+- `launchd/au.jobhunter.full.plist.template`：每天 02:00 运行一次完整抓取，沿用 `config.yaml` 的 336 小时窗口。
+
+模板只负责独立启动抓取，不启动 `webapp.py`，也不增加并发。`ThrottleInterval` 提供失败后的最小退避；SEEK 现有请求间隔保持不变。注意 Indeed 不接受 `hours_old`，增量模式对 Indeed 仍然是抓取后按 `date_posted` 本地过滤，请观察日志中的请求量。
+
+本次只交付模板，**没有替用户安装或启用 launchd**。用户确认后，在项目根目录执行：
+
+```bash
+mkdir -p output/launchd "$HOME/Library/LaunchAgents"
+sed "s|__PROJECT_ROOT__|$PWD|g" launchd/au.jobhunter.incremental.plist.template \
+  > "$HOME/Library/LaunchAgents/au.jobhunter.incremental.plist"
+sed "s|__PROJECT_ROOT__|$PWD|g" launchd/au.jobhunter.full.plist.template \
+  > "$HOME/Library/LaunchAgents/au.jobhunter.full.plist"
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/au.jobhunter.incremental.plist"
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/au.jobhunter.full.plist"
+```
+
+安装前先确认 API key、`config.yaml`、虚拟环境和输出目录均可用；首次启用后应在用户在场时观察两份日志，确认增量请求量和 `last_synced_at` 行为，再决定是否保留。
+
+## 手动完整刷新
 
 ```bash
 source venv/bin/activate
@@ -127,7 +150,7 @@ export ANTHROPIC_API_KEY=sk-ant-你的key
 python run.py
 ```
 
-不加 `--from-cache` 就是重新抓取。`config.yaml` 里 `hours_old: 168` 表示只要 7 天内的岗位，所以每周跑一次正好不重不漏。
+不加 `--from-cache` 就是完整重新抓取；`config.yaml` 默认 `hours_old: 336`，保留 14 天窗口。若已安装上面的 launchd 模板，日常由定时任务负责，手动命令适合排查或主动刷新。
 
 ## 大概花多少钱
 
@@ -145,4 +168,4 @@ python run.py
 
 **LinkedIn 抓一半停了** — 被限流了，正常。已经抓到的会存进缓存，等一小时后用 `--from-cache` 继续后面的步骤就行。
 
-**一个岗位都没到 70 分** — 先看 `jobs-ranked.csv` 里的理由。通常不是阈值问题，而是搜索词太窄或者 Melbourne 的 junior 岗位那一周确实少。可以把 `config.yaml` 的 `hours_old` 从 168 调到 336（两周）。
+**一个岗位都没到 70 分** — 先看 `jobs-ranked.csv` 里的理由。通常不是阈值问题，而是搜索词太窄或者 Melbourne 的 junior 岗位在窗口内确实少。可以把 `config.yaml` 的 `hours_old` 从 336 调大，但完整窗口越长，抓取量和限流风险也越高。

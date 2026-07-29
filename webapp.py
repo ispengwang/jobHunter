@@ -188,6 +188,25 @@ def _format_posted_at(value: str, timezone_name: str) -> tuple[str, str]:
     return local_posted.strftime("%Y-%m-%d %H:%M") + f" {zone_label}", relative
 
 
+def _has_precise_posted_at(value: str) -> bool:
+    raw = (value or "").strip()
+    if not raw or len(raw) <= 10:
+        return False
+    try:
+        datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
+
+
+def _timestamp_for_display(row: dict[str, str]) -> tuple[str, str]:
+    """Return the honest timestamp and label shown to the user."""
+    posted_at = row.get("posted_at", "")
+    if _has_precise_posted_at(posted_at):
+        return "发布于", posted_at
+    return "首次发现", row.get("first_seen_at", "")
+
+
 def _format_sync_at(value: str, timezone_name: str) -> str:
     raw = (value or "").strip()
     if not raw:
@@ -338,12 +357,17 @@ def _unified_dashboard_rows(
         status = row.get("status") or "review"
         display_status = _user_status(status)
         freshness = (
-            freshness_bucket(row.get("posted_at"), freshness_config, now)
+            freshness_bucket(
+                row.get("posted_at"), freshness_config, now,
+                first_seen_at=row.get("first_seen_at"),
+            )
             if freshness_config is not None
             else row.get("freshness_bucket") or "unknown"
         )
-        posted_display, posted_relative = _format_posted_at(
-            row.get("posted_at", ""), timezone_name
+        posted_label, display_timestamp = _timestamp_for_display(row)
+        posted_display, posted_relative = (
+            _format_posted_at(display_timestamp, timezone_name)
+            if display_timestamp else ("时间未知", "")
         )
         attempt = attempts_by_job.get(row.get("job_id", ""), {})
         platform_mode = platform_submission_mode(
@@ -373,7 +397,9 @@ def _unified_dashboard_rows(
             "freshness_bucket": freshness,
             "posted_display": posted_display,
             "posted_relative": posted_relative,
-            "posted_at_raw": row.get("posted_at", ""),
+            "posted_label": posted_label,
+            "freshness_timestamp": display_timestamp,
+            "posted_at_raw": display_timestamp,
             "source_label": (row.get("source") or "unknown").upper(),
             "today_action": "1" if row.get("job_id") in today_ids else "0",
             "latest_run": "1" if latest_run_id and row.get("last_run_id") == latest_run_id else "0",
@@ -1122,7 +1148,7 @@ DASHBOARD_HTML = """
     {% if sig == 'explicit_yes' %}<span class="chip yes">可担保</span>{% elif sig == 'explicit_no' %}<span class="chip no">不担保</span>{% else %}<span class="chip unknown">担保未提及</span>{% endif %}
     <span class="source-tag">{{ r.source_label }}</span>
   </div>
-  <div class="meta">{{ r.location or '地点未知' }} · 发布于 {{ r.posted_display }}{% if r.posted_relative %}（<span data-posted-relative="1">{{ r.posted_relative }}</span>）{% endif %} · {{ r.salary_raw or '薪资未列出' }} · {{ r.resume_id or '未选择简历' }}</div>
+  <div class="meta">{{ r.location or '地点未知' }} · {{ r.posted_label }} {{ r.posted_display }}{% if r.posted_relative %}（<span data-posted-relative="1">{{ r.posted_relative }}</span>）{% endif %} · {{ r.salary_raw or '薪资未列出' }} · {{ r.resume_id or '未选择简历' }}</div>
   <div class="reason"><b>JD 摘要：</b>{{ r.summary or 'DeepSeek 暂未返回摘要。' }}</div>
   <div class="score-detail"><b>评分理由：</b>{{ r.reason or '暂无匹配理由，需人工复核。' }}</div>
   <div class="score-detail">简历匹配：{{ r.resume_fit_score or '—' }}/100{% if r.resume_reason %} · {{ r.resume_reason }}{% endif %}{% if r.eligibility_reason %} · {{ r.eligibility_reason }}{% endif %}</div>
@@ -1375,7 +1401,7 @@ DASHBOARD_DETAIL_HTML = """
 <!doctype html>
 <html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{ row.title }} · Dashboard</title><style>""" + BASE_STYLE + """</style></head><body>
 <header class="top"><h1>岗位详情</h1><nav class="tabs"><a href="/dashboard" class="active">← Dashboard</a><a href="/profile">档案</a><a href="/scoring-rules">评分规则</a></nav></header>
-<div class="card"><h2>{{ row.title }} @ {{ row.company }}</h2><p class="hint">{{ row.location or '地点未知' }} · 发布于 {{ row.posted_display }}{% if row.posted_relative %}（{{ row.posted_relative }}）{% endif %} · {{ row.freshness_label }} · <a href="{{ row.url }}" target="_blank" rel="noopener">打开原始岗位链接</a></p>
+<div class="card"><h2>{{ row.title }} @ {{ row.company }}</h2><p class="hint">{{ row.location or '地点未知' }} · {{ row.posted_label }} {{ row.posted_display }}{% if row.posted_relative %}（{{ row.posted_relative }}）{% endif %} · {{ row.freshness_label }} · <a href="{{ row.url }}" target="_blank" rel="noopener">打开原始岗位链接</a></p>
 <p><b>JD 摘要：</b>{{ row.job_summary or 'DeepSeek 暂未返回摘要。' }}<br><b>岗位匹配：</b>{{ row.job_fit_score or '—' }}/100 — {{ row.job_fit_reason or '—' }}<br><b>简历：</b>{{ row.resume_id or '—' }} · {{ row.resume_fit_score or '—' }}/100 — {{ row.resume_reason or '—' }}<br><b>申请路径：</b>{{ row.application_mode or 'manual_review' }} — {{ row.eligibility_reason or '—' }}</p>
 {% if row.artifact_path %}<p class="hint">材料目录：{{ row.artifact_path }}</p>{% endif %}</div>
 <div class="card"><h2>更新记录</h2><p class="hint">Dashboard 是展示账本。只有平台成功页或确认文本可把岗位标记为 submitted；Agent 选择、打开页面或填完表单都不算提交。</p>
@@ -1575,9 +1601,13 @@ def dashboard_detail(job_id: str):
     row["freshness_label"] = FRESHNESS_LABELS.get(
         row["freshness_bucket"], row["freshness_bucket"]
     )
-    row["posted_display"], row["posted_relative"] = _format_posted_at(
-        row.get("posted_at", ""),
-        str(cfg.get("applypilot", {}).get("timezone", "Australia/Melbourne")),
+    row["posted_label"], display_timestamp = _timestamp_for_display(row)
+    row["posted_display"], row["posted_relative"] = (
+        _format_posted_at(
+            display_timestamp,
+            str(cfg.get("applypilot", {}).get("timezone", "Australia/Melbourne")),
+        )
+        if display_timestamp else ("时间未知", "")
     )
     service = _attempts(cfg)
     attempts = [
@@ -1588,9 +1618,13 @@ def dashboard_detail(job_id: str):
     if attempt:
         attempt = dict(attempt)
         attempt["status_label"] = ATTEMPT_LABELS.get(attempt.get("status", ""), attempt.get("status", ""))
-        mode = platform_submission_mode(row.get("source", ""), row.get("url", ""))
+        mode = platform_submission_mode(
+            row.get("source", ""), row.get("url", ""), cfg,
+        )
         attempt["platform_mode_label"] = PLATFORM_MODE_LABELS.get(mode, mode)
-    platform_mode = platform_submission_mode(row.get("source", ""), row.get("url", ""))
+    platform_mode = platform_submission_mode(
+        row.get("source", ""), row.get("url", ""), cfg,
+    )
     return render_template_string(
         DASHBOARD_DETAIL_HTML, row=row, events=board.events_for(job_id),
         statuses=USER_STATUSES, status_labels=USER_STATUS_LABELS, attempt=attempt,

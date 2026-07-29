@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from schema import Job, canonical_job_id, legacy_job_id, parse_salary, norm_company, norm_title
 from dedupe import dedupe
 from score import visa_filter, sponsorship_signal
-from run import prepare_scraped_jobs, load_jobs, save_jobs
+from run import jobs_to_score, prepare_scraped_jobs, load_jobs, representative_sample, save_jobs
 
 PASS = FAIL = 0
 
@@ -101,10 +101,26 @@ with tempfile.TemporaryDirectory() as temp_dir:
     cache_path = Path(temp_dir) / "jobs-raw.csv"
     save_jobs(result, cache_path)
     before = cache_path.read_text(encoding="utf-8")
-    limited = prepare_scraped_jobs(result, cache_path, limit=1)
-    check("--limit 只缩小本轮处理集", len(limited), 1)
+    limited = representative_sample(result, limit=1)
+    check("--limit 只缩小去重后的本轮处理集", len(limited), 1)
+    deferred = prepare_scraped_jobs(result, cache_path, limit=1)
+    check("--limit 延后到签证过滤后处理", len(deferred), len(result))
     check("--limit 不覆写主抓取缓存", cache_path.read_text(encoding="utf-8"), before)
     check("未限流时缓存仍可完整读回", len(load_jobs(cache_path)), len(result))
+
+sample_jobs = [
+    mk("seek", "Senior Backend Engineer", "FreshCo", "https://seek.example/fresh", loc="Melbourne VIC"),
+    mk("seek", "Graduate Software Engineer", "JuniorCo", "https://seek.example/junior", loc="Melbourne VIC"),
+    mk("seek", "Software Engineer", "OldCo", "https://seek.example/old", loc="Melbourne VIC"),
+]
+sample_jobs[0].posted_date = "2026-07-29T10:00:00+00:00"
+sample_jobs[1].posted_date = "2026-07-20"
+sample_jobs[2].posted_date = "2026-07-01"
+sample = representative_sample(sample_jobs, limit=2)
+check("代表性 limit 保留 junior 岗位", any("Graduate" in job.title for job in sample), True)
+check("代表性 limit 保留最新岗位", any(job.company == "FreshCo" for job in sample), True)
+check("增量打分只返回新 job_id", [job.company for job in jobs_to_score(sample_jobs, {sample_jobs[0].id})], ["JuniorCo", "OldCo"])
+check("rescore-all 返回全部岗位", len(jobs_to_score(sample_jobs, {job.id for job in sample_jobs}, rescore_all=True)), 3)
 
 atlassian_backend = [j for j in result
                      if norm_company(j.company) == "atlassian"
