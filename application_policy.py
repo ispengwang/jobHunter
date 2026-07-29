@@ -25,8 +25,11 @@ _EXPERIENCE_RE = re.compile(
     r"""
     \b(?P<requirement>
         (?:(?:at\s+least|minimum(?:\s+of)?|a\s+minimum\s+of)\s+)?
-        (?P<years>\d+)\s*(?:\+|plus)?\s*years?
-        (?:\s*(?:-|–|—|to)\s*\d+\s*years?)?
+        (?P<years>\d+)
+        (?:
+            \s*(?:-|–|—|to)\s*\d+\s*years?
+            |\s*(?:\+|plus)?\s*years?
+        )
         (?:\s*(?:of\s+)?(?:relevant|professional|commercial|industry|software|work)?\s*experience)?
     )\b
     """,

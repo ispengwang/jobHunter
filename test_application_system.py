@@ -133,6 +133,7 @@ try:
         Scored(one_year_job, 75, "x", [], [], "unknown"), selection, cfg, now,
     )
     check("独立函数提取 1 年要求", _min_years_required(one_year_job.description), 1)
+    check("范围年限取最低值", _min_years_required("1-3 years experience"), 1)
     check("JD 要求 1 年可进入海投", one_year_decision.mode, "broad")
     check("1 年要求理由可解释", "1 year" in one_year_decision.reason)
     no_year_job = Job(
