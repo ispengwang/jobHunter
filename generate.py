@@ -139,10 +139,17 @@ def _write_summary(out_dir: Path, s: Scored) -> None:
 
 
 def generate(scored: list[Scored], llm, resume: str, preferences: str,
-             cfg: dict) -> list[Path]:
+             cfg: dict, root: Path | None = None) -> list[Path]:
     threshold = cfg["scoring"]["generate_threshold"]
     max_gen = cfg["scoring"]["max_generate"]
-    out_root = Path(cfg["paths"]["output_dir"]) / "applications"
+    project_root = (root or Path(__file__).resolve().parent).resolve()
+    configured_output = Path(cfg["paths"]["output_dir"])
+    out_root = (
+        configured_output
+        if configured_output.is_absolute()
+        else project_root / configured_output
+    ) / "applications"
+    out_root = out_root.resolve()
     out_root.mkdir(parents=True, exist_ok=True)
 
     # 旧调用方不会提供 resume_id/application_mode，保留其生成行为；新流程则只为

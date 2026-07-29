@@ -267,6 +267,15 @@ try:
         resume_path.read_text(encoding="utf-8"),
     )
     check("海投只调用模型生成求职信", material_llm.calls, 1)
+    relative_material_cfg = {
+        "scoring": {"generate_threshold": 70, "max_generate": 5},
+        "paths": {"output_dir": "material-output"},
+    }
+    relative_written = generate(
+        [broad], material_llm, resume_path.read_text(encoding="utf-8"), prefs,
+        relative_material_cfg, root=root,
+    )
+    check("相对输出路径锚定传入的项目根", relative_written[0].is_relative_to(root.resolve() / "material-output"))
 
     print("\n=== Dashboard ===")
     dashboard = Dashboard(root / "data" / "application-dashboard.csv", root / "data" / "application-events.csv")

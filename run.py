@@ -422,7 +422,7 @@ def main() -> None:
 
     # ---- 5. 生成材料(--autopilot 自动执行；普通流程仍需显式 --generate)
     from generate import generate
-    written = generate(scored, llm, resume, prefs, cfg)
+    written = generate(scored, llm, resume, prefs, cfg, root=ROOT)
 
     for s in scored:
         if s.artifact_path:
