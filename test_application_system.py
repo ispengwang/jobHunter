@@ -153,6 +153,22 @@ try:
     )
     check("JD new graduate 信号放行", graduate_decision.mode, "broad")
     check("new graduate 理由可解释", "new graduate" in graduate_decision.reason)
+    generic_job = Job(
+        "seek", "Software Engineer", "GenericCo", "https://example.test/jobs/generic",
+        description="Build useful software with a supportive engineering team.",
+    )
+    generic_selection = choose_resume(generic_job, variants, root)
+    check("多变体通用岗位简历分数低于门槛", generic_selection.fit_score < 72)
+    multi_variant_decision = decide_application_mode(
+        Scored(generic_job, 85, "x", [], [], "unknown"), generic_selection, cfg, now,
+        variant_count=len(variants),
+    )
+    check("多变体仍执行 resume-fit targeted 门槛", multi_variant_decision.mode, "broad")
+    single_variant_decision = decide_application_mode(
+        Scored(generic_job, 85, "x", [], [], "unknown"), generic_selection, cfg, now,
+        variant_count=1,
+    )
+    check("单变体只凭 job-fit 进入 targeted", single_variant_decision.mode, "targeted")
     check("三天内岗位新鲜度", freshness_bucket((now - timedelta(hours=60)).isoformat(), cfg, now), "within_3d")
     check("更早岗位新鲜度", freshness_bucket((now - timedelta(days=6)).isoformat(), cfg, now), "older")
     rules = "# Stable rules\n" + ("Use verified facts and return structured scores. " * 12)

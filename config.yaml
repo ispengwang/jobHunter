@@ -108,7 +108,7 @@ application:
   excluded_seniority_keywords: [senior, staff, principal, lead, manager, director]
   # 标题没有级别信号时，JD 要求超过此年限才转人工复核。
   max_years_experience: 2
-  # job-fit 与 resume-fit 都达到 targeted 阈值才走精投；否则达到 broad 阈值走海投。
+  # 多份简历时 job-fit 与 resume-fit 都达到 targeted 阈值才走精投；单份简历只看 job-fit。
   targeted_job_fit_threshold: 80
   targeted_resume_fit_threshold: 72
   broad_job_fit_threshold: 70
