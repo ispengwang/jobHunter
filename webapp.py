@@ -46,7 +46,6 @@ from application_attempts import (
     platform_submission_mode,
 )
 from application_policy import freshness_bucket
-from applypilot_executor import ApplyPilotExecutor
 from scrapers.seek_source import clean_seek_title
 
 ROOT = Path(__file__).parent
@@ -60,8 +59,6 @@ yaml.indent(mapping=2, sequence=2, offset=0)
 
 app = Flask(__name__)
 ACTION_TOKEN = secrets.token_urlsafe(32)
-APPLY_EXECUTOR = ApplyPilotExecutor(ROOT)
-
 # ---------------------------------------------------------------- 后台运行状态
 
 RUN_STATE = {
@@ -141,7 +138,7 @@ FRESHNESS_LABELS = {
     "within_24h": "24 小时内", "within_3d": "3 天内", "older": "较早发布", "unknown": "发布时间未知",
 }
 ATTEMPT_LABELS = {
-    "selected": "已交给 Agent", "queued": "等待 Agent",
+    "selected": "已加入投递清单", "queued": "已加入投递清单",
     "browser_opened": "浏览器已打开", "filling": "填写中",
     "needs_user": "需要你处理", "ready_to_submit": "待提交确认", "submitted": "已提交",
     "failed": "失败", "cancelled": "已取消",
@@ -150,14 +147,6 @@ PLATFORM_MODE_LABELS = {
     "manual_submit": "打开申请页，由你完成平台操作",
     "auto_if_allowed": "ApplyPilot 核验后可自动",
 }
-EXECUTION_LABELS = {
-    "queued": "等待后台 Agent",
-    "running": "后台 Agent 正在处理",
-    "finished": "后台 Agent 已结束",
-    "failed": "后台 Agent 启动失败",
-}
-
-
 def _user_status(status: str) -> str:
     """Project detailed internal execution states onto the four user-facing states."""
     return status if status in {"submitted", "rejected", "interview"} else "ready_to_apply"
@@ -307,7 +296,6 @@ def _unified_dashboard_rows(
     rows: list[dict[str, str]],
     today_ids: set[str],
     attempts_by_job: dict[str, dict[str, str]],
-    executor_states: dict[str, dict[str, str | int | None]] | None = None,
     timezone_name: str = "Australia/Melbourne",
     freshness_config: dict | None = None,
     now: datetime | None = None,
@@ -354,25 +342,12 @@ def _unified_dashboard_rows(
         )
         attempt = attempts_by_job.get(row.get("job_id", ""), {})
         platform_mode = platform_submission_mode(row.get("source", ""), row.get("url", ""))
-        execution = (executor_states or {}).get(attempt.get("attempt_id", ""), {})
         attempt_status = attempt.get("status", "")
-        execution_state = str(execution.get("state") or "")
-        if platform_mode == "manual_submit":
-            apply_button_label = (
-                "重新打开申请页" if attempt_status == "needs_user" else "打开并辅助投递"
-            )
-            apply_explanation = (
-                "点击后记录本次操作并打开原始申请页；平台步骤由你完成。"
-            )
-        else:
-            apply_button_label = (
-                "问题已处理，继续投递" if attempt_status == "needs_user"
-                else "继续投递" if attempt_status
-                else "开始投递"
-            )
-            apply_explanation = (
-                "点击后由 ApplyPilot Agent 核验当前页面；全部门槛通过时才会自动提交。"
-            )
+        apply_button_label = "加入投递清单"
+        apply_explanation = (
+            "点击后只记录到本地投递清单，不会启动后台进程或打开招聘网站；"
+            "当前 Agent 可通过 --handoff-list 读取。"
+        )
         if row.get("next_action") == "Run the queued handoff with the applypilot-au skill":
             row["next_action"] = (
                 "Current Agent will continue automatically"
@@ -401,8 +376,6 @@ def _unified_dashboard_rows(
             "attempt_readiness": attempt.get("readiness", ""),
             "platform_mode": platform_mode,
             "platform_mode_label": PLATFORM_MODE_LABELS.get(platform_mode, platform_mode),
-            "execution_state": execution_state,
-            "execution_state_label": EXECUTION_LABELS.get(execution_state, execution_state),
             "apply_button_label": apply_button_label,
             "apply_explanation": apply_explanation,
             "freshness_order": str(freshness_order.get(freshness, 9)),
@@ -454,29 +427,12 @@ def _run_pipeline(cmd: list[str], env_overrides: dict) -> None:
             RUN_STATE["running"] = False
 
 
-def _reconcile_applypilot_exit(attempt_id: str, returncode: int, error: str) -> None:
-    """Ensure a finished background Agent cannot leave a misleading selected/running record."""
-    service = _attempts(load_config())
-    attempt = service.get(attempt_id)
-    if not attempt or attempt.get("status") in {
-        "submitted", "needs_user", "failed", "cancelled",
-    }:
-        return
-    reason = error.strip() or (
-        "后台 Agent 已结束，但没有通过 run.py 写回 submitted、needs_user 或 failed。"
-    )
-    service.advance(attempt_id, "failed", actor="system", reason=reason)
-
-
 def _attempt_public_payload(
     attempt: dict[str, str],
     *,
     message: str = "",
-    open_url: str = "",
 ) -> dict[str, str | int | bool | None]:
-    """Return browser-safe execution state without local profile/resume paths."""
-    snapshot = APPLY_EXECUTOR.snapshot(attempt["attempt_id"])
-    executor = snapshot.as_dict() if snapshot else {}
+    """Return browser-safe attempt state without local profile/resume paths."""
     status = attempt.get("status", "")
     platform_mode = platform_submission_mode(
         attempt.get("platform", ""), attempt.get("url", "")
@@ -488,13 +444,7 @@ def _attempt_public_payload(
         "attempt_status_label": ATTEMPT_LABELS.get(status, status),
         "platform_mode": platform_mode,
         "platform_mode_label": PLATFORM_MODE_LABELS.get(platform_mode, platform_mode),
-        "executor_state": executor.get("state", ""),
-        "executor_state_label": EXECUTION_LABELS.get(str(executor.get("state") or ""), ""),
-        "returncode": executor.get("returncode"),
         "message": message,
-        "open_url": open_url,
-        "poll_url": url_for("applypilot_status", attempt_id=attempt["attempt_id"]),
-        "terminal": status in {"submitted", "needs_user", "failed", "cancelled"},
     }
 
 
@@ -1112,7 +1062,7 @@ DASHBOARD_HTML = """
 </div>
 
 <div class="today-banner">
-  <div><strong>单岗位投递 · 点击后立即接管</strong><span>按钮会直接启动 ApplyPilot：平台要求人工操作时打开申请页，允许自动化的外部 ATS 才由 Agent 核验并提交。每日软目标 30、硬上限 40。</span></div>
+  <div><strong>投递清单 · 点击后只记录本地任务</strong><span>按钮只会把岗位加入本地投递清单，不启动后台进程、不打开招聘网站。当前 Agent 通过 --handoff-list 读取并按 applypilot-au 规则执行。</span></div>
   <div class="status-tools">
     <span class="hint">最近同步 {{ latest_sync_count }} 条 · {{ latest_sync_display }}{% if latest_run_id %} · 批次 {{ latest_run_id }}{% endif %}</span>
     <button type="button" class="btn" onclick="setQueue('latest', document.querySelector('[data-v=latest]'))">查看最近同步</button>
@@ -1192,9 +1142,9 @@ DASHBOARD_HTML = """
   <div class="apply-panel" id="apply-panel-{{ r.job_id }}">
     <div class="apply-copy"><strong>{{ r.platform_mode_label }}</strong><span>{{ r.apply_explanation }} 只有成功确认页才会记为“已提交”。</span></div>
     <div class="apply-form">
-      <span class="apply-status {% if r.execution_state in ['queued', 'running'] %}running{% endif %}" id="apply-status-{{ r.job_id }}">{% if r.execution_state_label %}{{ r.execution_state_label }}{% elif r.attempt_status_label %}{{ r.attempt_status_label }}{% else %}尚未开始{% endif %}</span>
-      {% if r.display_status == 'ready_to_apply' and r.attempt_status != 'submitted' and r.execution_state not in ['queued', 'running'] %}
-      <form method="post" action="{{ url_for('queue_applypilot', job_id=r.job_id) }}" data-platform-mode="{{ r.platform_mode }}" data-open-url="{{ r.url }}" onsubmit="return startApplication(event, this)">
+      <span class="apply-status" id="apply-status-{{ r.job_id }}">{% if r.attempt_status_label %}{{ r.attempt_status_label }}{% else %}尚未加入清单{% endif %}</span>
+      {% if r.display_status == 'ready_to_apply' and r.attempt_status not in ['submitted', 'selected', 'queued', 'browser_opened', 'filling', 'ready_to_submit'] %}
+      <form method="post" action="{{ url_for('queue_applypilot', job_id=r.job_id) }}" onsubmit="return addToApplicationList(event, this)">
         <input type="hidden" name="action_token" value="{{ action_token }}">
         <button class="btn primary" type="submit">{{ r.apply_button_label }}</button>
       </form>
@@ -1359,66 +1309,26 @@ function updateStatusDialog(){
   reason.placeholder=returning?'请说明为什么重新进入待投递':'例如：收到面试邀请';
   document.getElementById('status-save').disabled=same;
 }
-async function startApplication(event, form){
+async function addToApplicationList(event, form){
   event.preventDefault();
   const button=form.querySelector('button');
   const panel=form.closest('.apply-panel');
   const status=panel.querySelector('.apply-status');
-  const manual=form.dataset.platformMode==='manual_submit';
-  let manualWindow=null;
-  if(manual){
-    manualWindow=window.open('about:blank','_blank');
-    if(manualWindow)manualWindow.opener=null;
-  }
   button.disabled=true;
-  status.className='apply-status running';
-  status.textContent=manual?'正在准备申请页…':'正在启动 ApplyPilot Agent…';
+  status.className='apply-status';
+  status.textContent='正在加入投递清单…';
   try{
     const response=await fetch(form.action,{method:'POST',body:new FormData(form),headers:{'Accept':'application/json'}});
     const data=await response.json();
-    if(!response.ok||!data.ok)throw new Error(data.error||'无法启动投递');
-    if(data.open_url){
-      if(manualWindow)manualWindow.location.href=data.open_url;
-      else window.open(data.open_url,'_blank','noopener');
-    }else if(manualWindow){
-      manualWindow.close();
-    }
-    status.className='apply-status '+(data.terminal?'':'running');
-    status.textContent=data.message||data.executor_state_label||data.attempt_status_label;
-    if(data.terminal){
-      button.disabled=false;
-      if(data.attempt_status==='submitted')form.remove();
-      else if(data.attempt_status==='needs_user')button.textContent=manual?'重新打开申请页':'问题已处理，继续投递';
-    }else{
-      pollApplication(data.poll_url,form,status);
-    }
+    if(!response.ok||!data.ok)throw new Error(data.error||'无法加入投递清单');
+    status.textContent=data.message||data.attempt_status_label||'已加入投递清单';
+    button.textContent='已加入投递清单';
   }catch(error){
-    if(manualWindow)manualWindow.close();
     status.className='apply-status error';
     status.textContent=error.message;
     button.disabled=false;
   }
   return false;
-}
-async function pollApplication(url,form,status){
-  try{
-    const response=await fetch(url,{headers:{'Accept':'application/json'}});
-    const data=await response.json();
-    if(!response.ok)throw new Error(data.error||'无法读取投递状态');
-    status.className='apply-status '+(data.terminal?'':'running');
-    status.textContent=data.message||data.executor_state_label||data.attempt_status_label;
-    if(data.terminal){
-      const button=form.querySelector('button');
-      if(data.attempt_status==='submitted')form.remove();
-      else{button.disabled=false;button.textContent='问题已处理，继续投递';}
-      return;
-    }
-    setTimeout(()=>pollApplication(url,form,status),2500);
-  }catch(error){
-    status.className='apply-status error';
-    status.textContent=error.message;
-    form.querySelector('button').disabled=false;
-  }
 }
 document.addEventListener('keydown',event=>{
   if(event.key==='Escape'&&!document.getElementById('status-modal').hidden)closeStatusDialog();
@@ -1569,7 +1479,6 @@ def dashboard_view():
     ranked_path = _project_path(cfg.get("paths", {}).get("output_dir", "output")) / "jobs-ranked.csv"
     rows = _unified_dashboard_rows(
         raw_rows, today_ids, attempts_by_job,
-        executor_states=APPLY_EXECUTOR.snapshots(),
         timezone_name=timezone_name,
         freshness_config=cfg,
         latest_run_id=latest_run_id,
@@ -1791,7 +1700,6 @@ def queue_applypilot(job_id: str):
 
         profile_path, profile = _candidate_profile(cfg)
         attempt = service.create(job_id, profile, profile_path, actor="user")
-        attempt = service.authorize_execution(attempt["attempt_id"], actor="user")
         if attempt.get("readiness") != "ready":
             reason = attempt.get("reason") or "Candidate Profile 尚未达到真实投递要求。"
             if attempt.get("status") != "needs_user":
@@ -1805,67 +1713,12 @@ def queue_applypilot(job_id: str):
                 return jsonify(payload)
             return redirect(url_for("candidate_profile"))
 
-        platform_mode = platform_submission_mode(
-            attempt.get("platform", ""), attempt.get("url", "")
-        )
-        if platform_mode == "manual_submit":
-            reason = (
-                f"{(attempt.get('platform') or '该平台').upper()} 当前要求由你完成平台操作；"
-                "JobHunter 已记录本次投递并为你打开原始申请页。"
-            )
-            if attempt.get("status") != "needs_user" or attempt.get("reason") != reason:
-                attempt = service.advance(
-                    attempt["attempt_id"], "needs_user", actor="applypilot", reason=reason,
-                )
-            payload = _attempt_public_payload(
-                attempt,
-                message="申请页已打开；请完成平台步骤，成功后在岗位详情中记录提交证据。",
-                open_url=attempt.get("url", ""),
-            )
-            if wants_json:
-                return jsonify(payload)
-            return redirect(attempt.get("url") or url_for("dashboard_view"))
-
-        if not bool(apply_cfg.get("auto_submit_enabled", False)):
-            reason = "config.yaml 已关闭 ApplyPilot 自动提交；需要你手动完成此岗位。"
-            attempt = service.advance(
-                attempt["attempt_id"], "needs_user", actor="system", reason=reason,
-            )
-            payload = _attempt_public_payload(attempt, message=reason)
-            return jsonify(payload) if wants_json else redirect(
-                url_for("dashboard_view", error=reason)
-            )
-
-        skill_path = Path(
-            attempt.get("skill_path")
-            or apply_cfg.get("skill_path", "")
-        ).expanduser()
-        snapshot = APPLY_EXECUTOR.submit(
-            attempt["attempt_id"],
-            skill_path,
-            on_complete=_reconcile_applypilot_exit,
-        )
-        attempt = service.get(attempt["attempt_id"]) or attempt
-        message = (
-            "ApplyPilot Agent 正在核验页面与材料。"
-            if snapshot.state == "running"
-            else "已交给 ApplyPilot Agent；浏览器任务会依次执行，避免互相冲突。"
-        )
+        message = "已加入本地投递清单；当前 Agent 可运行 venv/bin/python run.py --handoff-list 读取。"
         payload = _attempt_public_payload(attempt, message=message)
         if wants_json:
             return jsonify(payload)
         return redirect(url_for("dashboard_view", saved="1"))
     except (KeyError, OSError, ValueError) as exc:
-        if attempt and attempt.get("status") in {
-            "selected", "queued", "browser_opened", "filling", "ready_to_submit",
-        }:
-            try:
-                service.advance(
-                    attempt["attempt_id"], "failed", actor="system",
-                    reason=f"无法启动 ApplyPilot Agent：{exc}",
-                )
-            except (KeyError, ValueError):
-                pass
         return failure(str(exc))
 
 
@@ -1886,27 +1739,6 @@ def applypilot_handoff(attempt_id: str):
         return jsonify(_attempts(cfg).handoff_payload(attempt_id))
     except KeyError as exc:
         return jsonify({"error": str(exc)}), 404
-
-
-@app.route("/applypilot/<attempt_id>/status", methods=["GET"])
-def applypilot_status(attempt_id: str):
-    cfg = load_config()
-    attempt = _attempts(cfg).get(attempt_id)
-    if not attempt:
-        return jsonify({"ok": False, "error": "找不到该投递记录"}), 404
-    if attempt.get("status") == "submitted":
-        message = "已确认提交成功。"
-    elif attempt.get("status") == "needs_user":
-        message = attempt.get("reason") or "需要你处理后才能继续。"
-    elif attempt.get("status") == "failed":
-        message = attempt.get("reason") or "后台 Agent 执行失败。"
-    else:
-        snapshot = APPLY_EXECUTOR.snapshot(attempt_id)
-        message = (
-            EXECUTION_LABELS.get(snapshot.state, snapshot.state)
-            if snapshot else ATTEMPT_LABELS.get(attempt.get("status", ""), "")
-        )
-    return jsonify(_attempt_public_payload(attempt, message=message))
 
 
 @app.route("/applypilot/<attempt_id>/advance", methods=["POST"])

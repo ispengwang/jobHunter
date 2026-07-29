@@ -11,7 +11,6 @@ import yaml
 
 from application_policy import _min_years_required, decide_application_mode, freshness_bucket
 from application_attempts import ApplicationAttempts, platform_submission_mode
-from applypilot_executor import ExecutionSnapshot, build_agent_prompt
 from candidate_profile import UNKNOWN, load_or_initialise, save_profile
 from dashboard import Dashboard
 from resume_catalog import choose_resume, ensure_default_manifest, load_catalog
@@ -404,9 +403,14 @@ try:
     check("浏览器交接包含选定简历路径", handoff["resume_path"], str(selection.path))
     check("浏览器交接明确由 ApplyPilot 执行", handoff["executor"], "applypilot-au")
     check("启动提示词明确引用 Skill", "applypilot-au" in attempts.launch_prompt(attempt["attempt_id"]))
-    executor_prompt = build_agent_prompt(attempt["attempt_id"], skill_path, root)
-    check("单岗位执行器只引用内部记录", attempt["attempt_id"] in executor_prompt)
-    check("执行器提示禁止重新搜索", "不重新搜索岗位" in executor_prompt)
+    handoff_list = attempts.handoff_list()
+    check("handoff 清单只含 selected/queued", all(
+        item["attempt_id"] != attempt["attempt_id"] for item in handoff_list
+    ))
+    check("handoff 清单包含待执行岗位", any(
+        item["job_fit_score"] == "86" for item in handoff_list
+    ))
+    check("handoff 清单不含候选人邮箱", "jane@example.com" in str(handoff_list), False)
     dashboard.upsert_recommendation(
         job, job_fit_score=91, job_fit_reason="重新评分", sponsorship_signal="unknown",
         job_summary="更新后的 JD 摘要",
@@ -494,8 +498,9 @@ try:
         check("Dashboard 按当前时间重算过期新鲜度", stale_rows[0]["freshness_bucket"], "older")
         check("Dashboard 不再显示手动队列按钮", "加入 ApplyPilot 投递队列" in dashboard_html, False)
         check("Dashboard 不再要求复制启动提示词", "复制启动提示词" in dashboard_html, False)
-        check("Dashboard 说明点击后立即接管", "单岗位投递 · 点击后立即接管" in dashboard_html)
-        check("Dashboard 显示投递按钮", "打开并辅助投递" in dashboard_html)
+        check("Dashboard 说明点击后只加入本地清单", "投递清单 · 点击后只记录本地任务" in dashboard_html)
+        check("Dashboard 显示加入投递清单按钮", "加入投递清单" in dashboard_html)
+        check("Dashboard 不启动后台 ApplyPilot", "直接启动 ApplyPilot" in dashboard_html, False)
         check("Dashboard 显示确认已提交入口", "确认已提交" in dashboard_html)
         check("Dashboard 保留状态转换入口", "转换申请状态" in dashboard_html)
         check("Dashboard 状态编辑只渲染一个共享表单", dashboard_html.count('id="status-form"'), 1)
@@ -563,11 +568,11 @@ try:
             headers={"Accept": "application/json"},
         )
         manual_payload = manual_start.get_json()
-        check("LinkedIn 按钮进入手动辅助模式", manual_payload["platform_mode"], "manual_submit")
-        check("手动模式返回原始申请页", manual_payload["open_url"], linked_in.url)
+        check("加入清单保留平台模式", manual_payload["platform_mode"], "manual_submit")
+        check("加入清单不返回外部打开地址", "open_url" in manual_payload, False)
         linked_attempt = webapp._attempts(webapp.load_config()).get(manual_payload["attempt_id"])
-        check("点击按钮记录单岗位明确授权", linked_attempt["data_transmission_confirmed"], "yes")
-        check("手动平台明确等待用户操作", linked_attempt["status"], "needs_user")
+        check("点击按钮不代表资料外发授权", linked_attempt["data_transmission_confirmed"], "")
+        check("点击按钮只创建 selected 记录", linked_attempt["status"], "selected")
         missing_evidence = client.post(
             f"/dashboard/{linked_in.id}/transition",
             data={
@@ -581,7 +586,7 @@ try:
         check(
             "缺少证据不会误记提交",
             webapp._dashboard(webapp.load_config()).get(linked_in.id)["status"],
-            "needs_user",
+            "ready_to_apply",
         )
         confirmed_submission = client.post(
             f"/dashboard/{linked_in.id}/transition",
@@ -614,44 +619,17 @@ try:
         check("状态转换写入面试中", converted_row["status"], "interview")
         check("状态转换保留提交证据", converted_row["submission_evidence"], "Application received · confirmation AU-123")
 
-        class FakeExecutor:
-            def __init__(self):
-                self.started = []
-                self.by_id = {}
-
-            def submit(self, attempt_id, skill_path, on_complete=None):
-                self.started.append((attempt_id, skill_path))
-                snapshot = ExecutionSnapshot(attempt_id, "queued", "2026-07-24T00:00:00+00:00")
-                self.by_id[attempt_id] = snapshot
-                return snapshot
-
-            def snapshot(self, attempt_id):
-                return self.by_id.get(attempt_id)
-
-            def snapshots(self):
-                return {
-                    attempt_id: snapshot.as_dict()
-                    for attempt_id, snapshot in self.by_id.items()
-                }
-
-        old_executor = webapp.APPLY_EXECUTOR
-        fake_executor = FakeExecutor()
-        webapp.APPLY_EXECUTOR = fake_executor
-        try:
-            automatic_start = client.post(
-                f"/dashboard/{second_seek.id}/applypilot",
-                data={"action_token": webapp.ACTION_TOKEN},
-                headers={"Accept": "application/json"},
-            )
-            automatic_payload = automatic_start.get_json()
-            check("外部 ATS 点击后立即交给后台 Agent", automatic_payload["executor_state"], "queued")
-            check("后台只收到对应内部记录", fake_executor.started[0][0], automatic_payload["attempt_id"])
-            status_payload = client.get(
-                automatic_payload["poll_url"], headers={"Accept": "application/json"},
-            ).get_json()
-            check("Dashboard 可轮询后台状态", status_payload["executor_state"], "queued")
-        finally:
-            webapp.APPLY_EXECUTOR = old_executor
+        automatic_start = client.post(
+            f"/dashboard/{second_seek.id}/applypilot",
+            data={"action_token": webapp.ACTION_TOKEN},
+            headers={"Accept": "application/json"},
+        )
+        automatic_payload = automatic_start.get_json()
+        check("外部 ATS 点击后只加入清单", automatic_payload["attempt_status"], "selected")
+        check("加入清单响应不含后台 executor", "executor_state" in automatic_payload, False)
+        check("旧后台状态轮询路由已移除", client.get(
+            f"/applypilot/{automatic_payload['attempt_id']}/status"
+        ).status_code, 404)
         valid_rules = rules + "\n" + " id score summary reason matched missing sponsorship_signal " * 8
         saved_rules = client.post("/scoring-rules/save", data={
             "expected_hash": webapp._rules_hash(rules),

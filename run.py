@@ -12,6 +12,7 @@
   python run.py --from-cache       # 复用上次抓取结果,只重跑打分
   python run.py --limit 20         # 只处理前 N 个,首次试跑用
   python run.py --autopilot        # 搜索、DeepSeek 打分、同步并交给当前 Agent 继续投递
+  python run.py --handoff-list     # 输出当前已选/排队的本地投递清单
   python run.py --attempt-handoff ID
 """
 from __future__ import annotations
@@ -238,6 +239,10 @@ def main() -> None:
         "--autopilot", action="store_true",
         help="运行完整搜索和 DeepSeek 打分，自动选出可投岗位并生成当前 Agent 的执行清单",
     )
+    ap.add_argument(
+        "--handoff-list", action="store_true",
+        help="输出 selected/queued 投递记录的本地 Agent handoff 清单，然后退出",
+    )
     ap.add_argument("--attempt-handoff",
                     help="打印某条 Agent 内部执行记录的无敏感信息说明，然后退出")
     ap.add_argument("--attempt-update",
@@ -262,7 +267,9 @@ def main() -> None:
         ap.error("--autopilot 要求 config.yaml 的 llm.provider 为 deepseek")
     if args.autopilot and not bool(cfg.get("applypilot", {}).get("autonomous", True)):
         ap.error("config.yaml 已关闭 applypilot.autonomous")
-    if args.attempt_handoff or args.attempt_update:
+    if args.handoff_list and (args.attempt_handoff or args.attempt_update):
+        ap.error("--handoff-list 不能与 --attempt-handoff/--attempt-update 同时使用")
+    if args.handoff_list or args.attempt_handoff or args.attempt_update:
         from application_attempts import ApplicationAttempts
         from dashboard import Dashboard
         board = Dashboard(
@@ -278,7 +285,9 @@ def main() -> None:
             skill_path=project_path(configured_skill) if configured_skill else None,
             project_root=ROOT,
         )
-        if args.attempt_handoff:
+        if args.handoff_list:
+            result = attempts.handoff_list()
+        elif args.attempt_handoff:
             result = attempts.handoff_payload(args.attempt_handoff)
         else:
             if not args.attempt_status:

@@ -360,6 +360,47 @@ class ApplicationAttempts:
             ),
         }
 
+    def handoff_list(self) -> list[dict[str, str]]:
+        """Return selected/queued attempts for the current Agent session.
+
+        This is a local handoff manifest, not a consent record. Keep it limited to the
+        fields the Agent needs to order and execute attempts; candidate contact details,
+        profile contents and API credentials never enter the result.
+        """
+        dashboard_rows = {
+            row.get("job_id", ""): row for row in self.dashboard.load_rows()
+        }
+        freshness_order = {"within_24h": 0, "within_3d": 1, "older": 2, "unknown": 3}
+        result: list[dict[str, str]] = []
+        for attempt in self.load_rows():
+            if attempt.get("status") not in {"selected", "queued"}:
+                continue
+            row = dashboard_rows.get(attempt.get("job_id", ""), {})
+            freshness = self.dashboard.current_freshness(row)
+            platform = attempt.get("platform", "")
+            url = attempt.get("url", "")
+            result.append({
+                "attempt_id": attempt.get("attempt_id", ""),
+                "company": attempt.get("company", ""),
+                "title": attempt.get("title", ""),
+                "url": url,
+                "platform": platform,
+                "platform_mode": platform_submission_mode(platform, url),
+                "job_fit_score": row.get("job_fit_score", ""),
+                "resume_fit_score": row.get("resume_fit_score", ""),
+                "freshness": freshness,
+                "resume_path": attempt.get("resume_path", ""),
+                "readiness": attempt.get("readiness", "unknown"),
+            })
+        result.sort(key=lambda item: (
+            freshness_order.get(item["freshness"], 9),
+            -_score(item["job_fit_score"]),
+            -_score(item["resume_fit_score"]),
+            item["company"].casefold(),
+            item["title"].casefold(),
+        ))
+        return result
+
     def launch_prompt(self, attempt_id: str) -> str:
         """Build a legacy prompt for old bookmarks; autonomous runs do not require copy/paste."""
         payload = self.handoff_payload(attempt_id)
