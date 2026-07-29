@@ -3,6 +3,7 @@
 覆盖薪资解析、去重、签证过滤 —— 这三块是最容易悄悄出错又最难事后发现的。
 """
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -10,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from schema import Job, parse_salary, norm_company, norm_title
 from dedupe import dedupe
 from score import visa_filter, sponsorship_signal
+from run import prepare_scraped_jobs, load_jobs, save_jobs
 
 PASS = FAIL = 0
 
@@ -82,6 +84,15 @@ jobs = [
 
 result = dedupe(jobs, fuzzy_threshold=88)
 check("去重后数量", len(result), 3)
+
+with tempfile.TemporaryDirectory() as temp_dir:
+    cache_path = Path(temp_dir) / "jobs-raw.csv"
+    save_jobs(result, cache_path)
+    before = cache_path.read_text(encoding="utf-8")
+    limited = prepare_scraped_jobs(result, cache_path, limit=1)
+    check("--limit 只缩小本轮处理集", len(limited), 1)
+    check("--limit 不覆写主抓取缓存", cache_path.read_text(encoding="utf-8"), before)
+    check("未限流时缓存仍可完整读回", len(load_jobs(cache_path)), len(result))
 
 atlassian_backend = [j for j in result
                      if norm_company(j.company) == "atlassian"

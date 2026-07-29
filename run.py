@@ -99,6 +99,16 @@ def save_jobs(jobs: list[Job], path: Path) -> None:
     log.info("已写入 %s (%d 条)", path, len(jobs))
 
 
+def prepare_scraped_jobs(jobs: list[Job], cache_path: Path, limit: int | None = None) -> list[Job]:
+    """Persist a complete scrape, or narrow only this run when ``--limit`` is set."""
+    if limit:
+        limited = jobs[:limit]
+        log.info("--limit 生效,本次只处理 %d 条；保持主缓存不变: %s", len(limited), cache_path)
+        return limited
+    save_jobs(jobs, cache_path)
+    return jobs
+
+
 def load_jobs(path: Path) -> list[Job]:
     jobs = []
     with open(path, encoding="utf-8") as f:
@@ -307,10 +317,7 @@ def main() -> None:
             sys.exit(1)
         # ---- 2. 归一化已在各 source 内完成,直接去重
         jobs = dedupe(jobs, cfg["dedupe"]["fuzzy_threshold"])
-        if args.limit:
-            jobs = jobs[:args.limit]
-            log.info("--limit 生效,保留前 %d 条存入缓存", len(jobs))
-        save_jobs(jobs, cache_path)
+        jobs = prepare_scraped_jobs(jobs, cache_path, args.limit)
 
     if args.scrape_only:
         log.info("--scrape-only 完成,不调用 LLM。")
