@@ -112,6 +112,13 @@ if atlassian_backend:
     check("收集了其他平台 URL", len(j.duplicate_urls), 2)
     check("描述取最长的", len(j.description), 300)
 
+unknown_jobs = [
+    mk("seek", "Software Engineer", "Unknown", "https://seek.example/unknown-1"),
+    mk("indeed", "Software Engineer", "Unknown", "https://indeed.example/unknown-2"),
+]
+unknown_result = dedupe(unknown_jobs, fuzzy_threshold=88)
+check("Unknown 公司同名岗位不被误合并", len(unknown_result), 2)
+
 titles = sorted(norm_title(j.title) for j in result)
 check("剩余岗位正确", titles, ["frontend engineer", "senior backend engineer", "senior backend engineer"])
 

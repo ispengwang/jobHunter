@@ -73,13 +73,21 @@ def dedupe(jobs: list[Job], fuzzy_threshold: int = 88) -> list[Job]:
 
     # ---- 二级:company + title + location 精确
     by_key: dict[tuple, Job] = {}
+    stage2: list[Job] = []
     for j in stage1:
-        key = (norm_company(j.company), norm_title(j.title), norm_location(j.location))
+        company = norm_company(j.company)
+        # Unknown/blank company names are not identities.  Keep each URL as
+        # its own record; otherwise unrelated employers with the same generic
+        # title would merge before the fuzzy guard even runs.
+        if not company or company == "unknown":
+            stage2.append(j)
+            continue
+        key = (company, norm_title(j.title), norm_location(j.location))
         if key in by_key:
             by_key[key] = _merge(*_ordered(by_key[key], j))
         else:
             by_key[key] = j
-    stage2 = list(by_key.values())
+    stage2.extend(by_key.values())
 
     # ---- 三级:同公司内 title 模糊匹配
     try:
@@ -95,7 +103,7 @@ def dedupe(jobs: list[Job], fuzzy_threshold: int = 88) -> list[Job]:
 
     result: list[Job] = []
     for company, group in buckets.items():
-        if not company or len(group) == 1:
+        if not company or company == "unknown" or len(group) == 1:
             result.extend(group)
             continue
 
