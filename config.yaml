@@ -8,6 +8,11 @@ search:
   - AI Product Engineer
   - Generative AI Engineer
   - Full Stack Developer AI
+  - Graduate AI Engineer
+  - Junior AI Engineer
+  - Associate Software Engineer
+  - Entry Level Software Engineer
+  - Graduate Developer
   # web/全栈基础盘,兜住 AI 方向没覆盖到的岗位
   - Junior Full Stack Developer
   - Frontend Developer React
@@ -15,7 +20,7 @@ search:
   location: "Melbourne VIC"   # 改成 Sydney NSW / Brisbane QLD 等
   country: "australia"
   results_per_term: 50
-  hours_old: 336              # 只要 7 天内的岗位
+  hours_old: 336              # 只要 14 天内的岗位（336 小时）
   is_remote: false
 
 sources:
