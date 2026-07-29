@@ -1,4 +1,5 @@
 venv/
+.env
 .codegraph/
 __pycache__/
 *.pyc

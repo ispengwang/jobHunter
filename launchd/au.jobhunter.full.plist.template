@@ -6,8 +6,7 @@
   <string>au.jobhunter.full</string>
   <key>ProgramArguments</key>
   <array>
-    <string>__PROJECT_ROOT__/venv/bin/python</string>
-    <string>__PROJECT_ROOT__/run.py</string>
+    <string>__PROJECT_ROOT__/scripts/run-jobhunter.sh</string>
   </array>
   <key>WorkingDirectory</key>
   <string>__PROJECT_ROOT__</string>

@@ -128,7 +128,41 @@ Markdown 转 PDF 最简单的办法是用 VS Code 装 "Markdown PDF" 插件，�
 
 模板只负责独立启动抓取，不启动 `webapp.py`，也不增加并发。`ThrottleInterval` 提供失败后的最小退避；SEEK 现有请求间隔保持不变。注意 Indeed 不接受 `hours_old`，增量模式对 Indeed 仍然是抓取后按 `date_posted` 本地过滤，请观察日志中的请求量。
 
-本次只交付模板，**没有替用户安装或启用 launchd**。用户确认后，在项目根目录执行：
+两个 plist 都不直接调 `python`，而是调 `scripts/run-jobhunter.sh`。
+
+### 为什么需要 wrapper 和 `.env`
+
+**launchd 启动的进程不读取 shell profile。** 写在 `~/.zshrc` 里的 `export DEEPSEEK_API_KEY=...` 对定时任务完全无效 —— 直接让 plist 调 `python run.py` 的话，每 3 小时都会以「缺少环境变量 DEEPSEEK_API_KEY」失败一次。
+
+`scripts/run-jobhunter.sh` 负责加载项目根目录的 `.env` 再执行 `run.py`。找不到任何 key 时以退出码 `78`（`EX_CONFIG`）终止，并在 stderr 写明原因，不打印任何取值。
+
+手动在终端跑 `run.py` 不受影响，仍然用你 shell 里的环境变量。
+
+### 第一步：创建 `.env`
+
+```bash
+cp .env.example .env
+```
+
+然后填入 key。如果 key 已经在当前终端的环境变量里，可以直接写进去而不必手动复制：
+
+```bash
+printf 'DEEPSEEK_API_KEY=%s\n' "$DEEPSEEK_API_KEY" > .env
+```
+
+`.env` 已列入 `.gitignore`，不会被提交。文件权限建议收紧：
+
+```bash
+chmod 600 .env
+```
+
+验证 wrapper 能读到 key（这一步只抓取，不调用 LLM、不花钱）：
+
+```bash
+scripts/run-jobhunter.sh --scrape-only --incremental
+```
+
+### 第二步：安装
 
 ```bash
 mkdir -p output/launchd "$HOME/Library/LaunchAgents"
@@ -140,7 +174,16 @@ launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/au.jobhunter.incr
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/au.jobhunter.full.plist"
 ```
 
-安装前先确认 API key、`config.yaml`、虚拟环境和输出目录均可用；首次启用后应在用户在场时观察两份日志，确认增量请求量和 `last_synced_at` 行为，再决定是否保留。
+### 管理
+
+```bash
+launchctl list | grep jobhunter                                  # 看是否在运行
+launchctl kickstart -k "gui/$(id -u)/au.jobhunter.incremental"   # 立刻触发一次
+launchctl bootout "gui/$(id -u)/au.jobhunter.incremental"        # 停掉（可随时重装）
+tail -f output/launchd/incremental.stdout.log                    # 看日志
+```
+
+安装前先确认 `.env`、`config.yaml`、虚拟环境和输出目录均可用；首次启用后应在用户在场时观察两份日志，确认增量请求量和 `last_synced_at` 行为，再决定是否保留。
 
 ## 手动完整刷新
 
