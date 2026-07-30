@@ -256,6 +256,46 @@ def _fetch_description(job_id: str) -> str:
     return ""
 
 
+def location_slugs(seek_cfg: dict) -> list[str]:
+    """Return configured SEEK regions, preferring the new list setting.
+
+    An empty or invalid list falls back to the legacy single ``location_slug``
+    so existing configurations keep their current behaviour.
+    """
+    configured = seek_cfg.get("location_slugs")
+    if isinstance(configured, (list, tuple)):
+        slugs = [str(value).strip() for value in configured if str(value).strip()]
+        if slugs:
+            return slugs
+    legacy = str(seek_cfg.get("location_slug") or "All-Australia").strip()
+    return [legacy or "All-Australia"]
+
+
+def build_search_params(
+    term: str,
+    page: int,
+    location_slug: str,
+    *,
+    classification: str | None = None,
+    daterange: int | None = None,
+) -> dict:
+    """Build one SEEK request without changing the endpoint's throttle policy."""
+    params = {
+        "siteKey": "AU-Main",
+        "sourcesystem": "houston",
+        "where": location_slug,
+        "page": page,
+        "keywords": term,
+        "pageSize": _PAGE_SIZE,
+        "locale": "en-AU",
+    }
+    if classification:
+        params["classification"] = classification
+    if daterange:
+        params["daterange"] = daterange
+    return params
+
+
 def clean_seek_title(value: str) -> str:
     """Remove SEEK's glued-on ``New`` badge without touching real title words."""
     title = (value or "").strip()
@@ -330,48 +370,51 @@ def fetch(cfg: dict) -> list[Job]:
 
     hours = search.get("hours_old")
     daterange = max(1, round(hours / 24)) if hours else None
+    slugs = location_slugs(seek_cfg)
 
     jobs: list[Job] = []
     seen_ids: set[str] = set()
 
-    for term in search["terms"]:
-        for page in range(1, pages + 1):
-            params = {
-                "siteKey": "AU-Main",
-                "sourcesystem": "houston",
-                "where": seek_cfg.get("location_slug", "All-Australia"),
-                "page": page,
-                "keywords": term,
-                "pageSize": _PAGE_SIZE,
-                "locale": "en-AU",
-            }
-            if seek_cfg.get("classification"):
-                params["classification"] = seek_cfg["classification"]
-            if daterange:
-                params["daterange"] = daterange
+    if len(slugs) > 1:
+        log.info("SEEK 多地区搜索: %s（请求量约为单地区的 %d 倍）", ", ".join(slugs), len(slugs))
 
-            data = _get(_SEARCH_URL, params)
-            if not data:
-                log.warning("SEEK term=%r page=%d 请求失败,可能端点又变了", term, page)
-                break
+    for location_slug in slugs:
+        for term in search["terms"]:
+            for page in range(1, pages + 1):
+                params = build_search_params(
+                    term, page, location_slug,
+                    classification=seek_cfg.get("classification"),
+                    daterange=daterange,
+                )
 
-            items = data.get("data") or []
-            if not items:
-                break
+                data = _get(_SEARCH_URL, params)
+                if not data:
+                    log.warning(
+                        "SEEK location=%r term=%r page=%d 请求失败,可能端点又变了",
+                        location_slug, term, page,
+                    )
+                    break
 
-            new = 0
-            for item in items:
-                jid = str(item.get("id") or "")
-                if not jid or jid in seen_ids:
-                    continue
-                seen_ids.add(jid)
-                job = _parse_item(item, with_description=True)
-                if job:
-                    jobs.append(job)
-                    new += 1
+                items = data.get("data") or []
+                if not items:
+                    break
 
-            log.info("SEEK term=%r page=%d → %d 条(新增 %d)", term, page, len(items), new)
-            time.sleep(0.6)
+                new = 0
+                for item in items:
+                    jid = str(item.get("id") or "")
+                    if not jid or jid in seen_ids:
+                        continue
+                    seen_ids.add(jid)
+                    job = _parse_item(item, with_description=True)
+                    if job:
+                        jobs.append(job)
+                        new += 1
+
+                log.info(
+                    "SEEK location=%r term=%r page=%d → %d 条(新增 %d)",
+                    location_slug, term, page, len(items), new,
+                )
+                time.sleep(0.6)
 
     if jobs:
         with_salary = sum(1 for j in jobs if j.salary_min is not None)

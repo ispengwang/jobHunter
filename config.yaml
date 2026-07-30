@@ -38,6 +38,13 @@ seek:
   classification: "6281"
   # SEEK 的地区 slug
   location_slug: "All-Melbourne-VIC"
+  # 多地区时用列表；一旦启用会覆盖上面的 location_slug。默认保持单地区，
+  # 不要在没有确认通勤上限前自行放宽。候选值：
+  # All-Victoria-VIC / West-Gippsland-and-Latrobe-Valley-VIC /
+  # Mornington-Peninsula-VIC / Geelong-VIC
+  # location_slugs: [All-Melbourne-VIC, West-Gippsland-and-Latrobe-Valley-VIC]
+  # 请求量 = 搜索词数 × 地区数 × 页数；每 3 小时运行时加地区会等比例放大请求。
+  # 保留 seek_source.py 的现有 sleep；若失败，先降低频率，不要删节流。
 
 visa:
   # 你的情况：485 毕业生工签 + 需要后续担保

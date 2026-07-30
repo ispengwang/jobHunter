@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from scrapers.seek_source import (
     _parse_item, _first_label, _join_labels, _extract_description,
     _jsonld_description, _html_to_text, _parse_graphql_content, clean_seek_title,
+    location_slugs, build_search_params,
 )
 from scrapers.jobspy_source import _too_old
 
@@ -166,6 +167,30 @@ check("GraphQL 缺 content 字段", _parse_graphql_content({"data": {"jobDetails
 check("GraphQL data 为 null", _parse_graphql_content({"data": None}), "")
 check("GraphQL 报错响应", _parse_graphql_content({"errors": [{"message": "nope"}]}), "")
 check("GraphQL 空字典", _parse_graphql_content({}), "")
+
+print("\n=== SEEK 多地区配置 ===")
+check(
+    "location_slugs 优先于旧单值",
+    location_slugs({"location_slug": "legacy", "location_slugs": ["A", "B"]}),
+    ["A", "B"],
+)
+check(
+    "旧 location_slug 向后兼容",
+    location_slugs({"location_slug": "legacy"}),
+    ["legacy"],
+)
+check(
+    "空 location_slugs 回退旧配置",
+    location_slugs({"location_slug": "legacy", "location_slugs": []}),
+    ["legacy"],
+)
+params = build_search_params(
+    "AI Engineer", 2, "West-Gippsland-Latrobe-Valley-VIC",
+    classification="6281", daterange=14,
+)
+check("多地区 where 使用当前 slug", params["where"], "West-Gippsland-Latrobe-Valley-VIC")
+check("多地区保留分页参数", params["page"], 2)
+check("多地区保留分类和时间窗口", (params["classification"], params["daterange"]), ("6281", 14))
 
 
 print("\n=== Indeed 日期过滤(替代坏掉的 hours_old) ===")

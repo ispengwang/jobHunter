@@ -130,6 +130,20 @@ Markdown 转 PDF 最简单的办法是用 VS Code 装 "Markdown PDF" 插件，�
 
 两个 plist 都不直接调 `python`，而是调 `scripts/run-jobhunter.sh`。
 
+### SEEK 多地区（默认不启用）
+
+默认只抓 `All-Melbourne-VIC`。如果确认可以接受更远通勤范围，可以在 `config.yaml` 的 `seek` 下填写 `location_slugs` 列表；它存在时优先于旧的单值 `location_slug`。候选 slug 包括：
+
+```yaml
+location_slugs:
+  - All-Melbourne-VIC
+  - West-Gippsland-and-Latrobe-Valley-VIC
+  # - Mornington-Peninsula-VIC
+  # - Geelong-VIC
+```
+
+SEEK 请求量约等于「搜索词数 × 地区数 × 页数」。现在是 14 个搜索词、1 个地区；启用 3 个地区就是约 3 倍请求量，而增量任务每 3 小时运行一次。代码保留每个详情请求和分页请求之间的现有节流，不要为了提速删掉 `sleep` 或增加并发。若出现请求失败或限流，先降低定时频率，再考虑是否保留更多地区。LinkedIn/Indeed 暂不跟随这项配置放宽，先观察 SEEK 的覆盖效果。
+
 ### 为什么需要 wrapper 和 `.env`
 
 **launchd 启动的进程不读取 shell profile。** 写在 `~/.zshrc` 里的 `export DEEPSEEK_API_KEY=...` 对定时任务完全无效 —— 直接让 plist 调 `python run.py` 的话，每 3 小时都会以「缺少环境变量 DEEPSEEK_API_KEY」失败一次。
