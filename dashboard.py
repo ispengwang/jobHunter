@@ -19,7 +19,8 @@ REASON_REQUIRED = {"skipped", "blocked", "needs_user"}
 
 DASHBOARD_FIELDS = [
     "job_id", "company", "title", "source", "url", "duplicate_urls", "location",
-    "posted_at", "discovered_at", "first_seen_at", "job_fit_score", "job_fit_reason", "job_summary", "match_score",
+    "posted_at", "salary_raw", "discovered_at", "first_seen_at", "job_fit_score", "job_fit_reason",
+    "job_summary", "matched", "missing", "eligibility_reason", "match_score",
     "resume_id", "resume_path", "resume_fit_score", "resume_reason", "application_mode",
     "freshness_bucket", "sponsorship_signal", "status", "skip_reason",
     "blocked_reason", "needs_user_reason", "submitted_at", "submission_evidence",
@@ -84,6 +85,53 @@ class Dashboard:
             self._write_rows(rows)
         return touched
 
+    def backfill_export_fields(self, jobs: Iterable[Job], cfg: dict) -> int:
+        """Fill locally derivable export fields on older Dashboard rows.
+
+        ``matched`` and ``missing`` intentionally are not backfilled: they are
+        LLM output and an empty value is more truthful than a reconstruction.
+        Salary is copied only when the current raw cache has the same canonical
+        job.  Eligibility is recomputed with local rules and never calls an LLM.
+        """
+        from application_policy import eligibility_reason_for_job
+
+        jobs_by_id = {job.id: job for job in jobs}
+        rows = self.load_rows()
+        if not rows:
+            return 0
+        changed = 0
+        required_fields = set(DASHBOARD_FIELDS)
+        needs_schema_write = any(
+            field not in rows[0] for field in required_fields
+        )
+        for row in rows:
+            job = jobs_by_id.get(row.get("job_id", ""))
+            if job is None:
+                job = Job(
+                    source=row.get("source", ""),
+                    title=row.get("title", ""),
+                    company=row.get("company", ""),
+                    url=row.get("url", ""),
+                    location=row.get("location") or None,
+                    posted_date=row.get("posted_at") or None,
+                    description="",
+                    id=row.get("job_id", ""),
+                )
+            if not row.get("salary_raw") and job.salary_raw:
+                row["salary_raw"] = job.salary_raw
+                changed += 1
+            if not row.get("eligibility_reason"):
+                raw_score = row.get("job_fit_score") or row.get("match_score") or ""
+                try:
+                    score = int(float(raw_score))
+                except (TypeError, ValueError):
+                    score = -1
+                row["eligibility_reason"] = eligibility_reason_for_job(job, score, cfg)
+                changed += 1
+        if changed or needs_schema_write:
+            self._write_rows(rows)
+        return changed
+
     def _write_rows(self, rows: Iterable[dict[str, Any]]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temp = self.path.with_suffix(self.path.suffix + ".tmp")
@@ -123,6 +171,10 @@ class Dashboard:
         application_mode: str,
         freshness_bucket: str,
         job_summary: str = "",
+        salary_raw: str | None = None,
+        matched: Iterable[str] | str | None = None,
+        missing: Iterable[str] | str | None = None,
+        eligibility_reason: str | None = None,
         resume_path: str = "",
         run_id: str = "",
         artifact_path: str = "",
@@ -145,6 +197,14 @@ class Dashboard:
             "sponsorship_signal": sponsorship_signal, "last_updated_at": now,
             "last_run_id": run_id, "last_synced_at": now,
         }
+        if salary_raw is not None:
+            external["salary_raw"] = str(salary_raw or "")
+        if matched is not None:
+            external["matched"] = _join_values(matched)
+        if missing is not None:
+            external["missing"] = _join_values(missing)
+        if eligibility_reason is not None:
+            external["eligibility_reason"] = eligibility_reason
         base.update(external)
         if new_row:
             base.update({
@@ -244,3 +304,9 @@ def _int(value: Any) -> int:
         return int(str(value or "0"))
     except ValueError:
         return 0
+
+
+def _join_values(value: Iterable[str] | str) -> str:
+    if isinstance(value, str):
+        return value
+    return ", ".join(str(item) for item in value if str(item).strip())

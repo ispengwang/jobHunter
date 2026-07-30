@@ -17,6 +17,56 @@ class ApplicationDecision:
     reason: str
 
 
+def eligibility_reason_for_job(job, job_fit_score: int, cfg: dict) -> str:
+    """Recompute the local eligibility explanation without calling an LLM.
+
+    This is also used to backfill older Dashboard rows.  A missing JD snapshot is
+    reported as an explicit manual-review condition rather than being treated as
+    evidence that the role has no experience requirement.
+    """
+    app_cfg = cfg.get("application", {})
+    title = (job.title or "").casefold()
+    excluded = [str(x).casefold() for x in app_cfg.get("excluded_seniority_keywords", [])]
+    eligible = [str(x).casefold() for x in app_cfg.get("eligible_seniority_keywords", [])]
+
+    excluded_hit = next((word for word in excluded if word and word in title), None)
+    if excluded_hit:
+        return f"职位级别高于默认 entry/junior 范围（标题命中 {excluded_hit}）"
+
+    eligible_hit = next((word for word in eligible if word and word in title), None)
+    if eligible_hit:
+        eligibility_reason = f"标题命中级别词 {eligible_hit}，直接符合 entry/junior 范围"
+    elif not (job.description or "").strip():
+        return "当前本地没有 JD 快照，无法重新核验 entry/junior 资格，需人工确认"
+    else:
+        requirements = _experience_requirements(job.description or "")
+        max_years = int(app_cfg.get("max_years_experience", 2))
+        min_years = min((years for years, _ in requirements), default=None)
+        if min_years is not None and min_years > max_years:
+            source_text = next(text for years, text in requirements if years == min_years)
+            return (
+                f"JD 要求至少 {min_years} 年经验（命中“{source_text}”），"
+                f"超过 entry/junior 上限 {max_years} 年"
+            )
+        early_career_hit = _EARLY_CAREER_RE.search(job.description or "")
+        if early_career_hit:
+            eligibility_reason = (
+                f"JD 命中初级信号“{early_career_hit.group(0)}”，按 entry/junior 范围放行"
+            )
+        elif min_years is None:
+            eligibility_reason = "JD 未发现工作年限要求，按 entry/junior 策略放行"
+        else:
+            source_text = next(text for years, text in requirements if years == min_years)
+            eligibility_reason = (
+                f"JD 最低要求 {min_years} 年经验（命中“{source_text}”），"
+                f"不超过 entry/junior 上限 {max_years} 年"
+            )
+
+    if job_fit_score < int(app_cfg.get("broad_job_fit_threshold", 70)):
+        return f"{eligibility_reason}；岗位匹配分低于海投阈值"
+    return eligibility_reason
+
+
 # Keep this parser deliberately small and explainable.  It extracts the first
 # number in a requirement such as "5+ years", "minimum 3 years experience",
 # or "at least 4 years"; for a range such as "1-3 years" the lower bound is
@@ -108,51 +158,18 @@ def decide_application_mode(scored: Scored, resume: ResumeSelection, cfg: dict,
                             variant_count: int | None = None,
                             first_seen_at: str | None = None) -> ApplicationDecision:
     app_cfg = cfg.get("application", {})
-    title = (scored.job.title or "").casefold()
-    excluded = [str(x).casefold() for x in app_cfg.get("excluded_seniority_keywords", [])]
-    eligible = [str(x).casefold() for x in app_cfg.get("eligible_seniority_keywords", [])]
     freshness = freshness_bucket(
         scored.job.posted_date, cfg, now, first_seen_at=first_seen_at,
     )
-
-    excluded_hit = next((word for word in excluded if word and word in title), None)
-    if excluded_hit:
-        return ApplicationDecision(
-            freshness, False, "manual_review",
-            f"职位级别高于默认 entry/junior 范围（标题命中 {excluded_hit}）",
-        )
-
-    eligible_hit = next((word for word in eligible if word and word in title), None)
-    if eligible_hit:
-        eligibility_reason = f"标题命中级别词 {eligible_hit}，直接符合 entry/junior 范围"
-    else:
-        requirements = _experience_requirements(scored.job.description or "")
-        max_years = int(app_cfg.get("max_years_experience", 2))
-        min_years = min((years for years, _ in requirements), default=None)
-        if min_years is not None and min_years > max_years:
-            source_text = next(text for years, text in requirements if years == min_years)
-            return ApplicationDecision(
-                freshness, False, "manual_review",
-                f"JD 要求至少 {min_years} 年经验（命中“{source_text}”），超过 entry/junior 上限 {max_years} 年",
-            )
-        early_career_hit = _EARLY_CAREER_RE.search(scored.job.description or "")
-        if early_career_hit:
-            eligibility_reason = (
-                f"JD 命中初级信号“{early_career_hit.group(0)}”，按 entry/junior 范围放行"
-            )
-        elif min_years is None:
-            eligibility_reason = "JD 未发现工作年限要求，按 entry/junior 策略放行"
-        else:
-            source_text = next(text for years, text in requirements if years == min_years)
-            eligibility_reason = (
-                f"JD 最低要求 {min_years} 年经验（命中“{source_text}”），不超过 entry/junior 上限 {max_years} 年"
-            )
-
+    eligibility_reason = eligibility_reason_for_job(scored.job, scored.score, cfg)
+    if (
+        "职位级别高于默认 entry/junior 范围" in eligibility_reason
+        or eligibility_reason.startswith("JD 要求至少")
+        or "无法重新核验 entry/junior 资格" in eligibility_reason
+    ):
+        return ApplicationDecision(freshness, False, "manual_review", eligibility_reason)
     if scored.score < int(app_cfg.get("broad_job_fit_threshold", 70)):
-        return ApplicationDecision(
-            freshness, False, "manual_review",
-            f"{eligibility_reason}；岗位匹配分低于海投阈值",
-        )
+        return ApplicationDecision(freshness, False, "manual_review", eligibility_reason)
 
     # With one manifest entry there is no real choice to be made by the
     # resume-fit score.  ``None`` is kept backwards-compatible for direct

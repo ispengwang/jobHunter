@@ -48,6 +48,13 @@ ROOT = Path(__file__).parent
 CACHE = "jobs-raw.csv"
 RANKED = "jobs-ranked.csv"
 RANKED_MD = "jobs-ranked.md"
+RANKED_FIELDS = [
+    "score", "title", "company", "location", "posted_date", "salary_raw",
+    "sponsorship_signal", "summary", "reason", "matched", "missing",
+    "resume_id", "resume_fit_score", "resume_reason", "application_mode",
+    "eligibility_reason", "freshness_bucket", "artifact_path", "source", "url",
+    "duplicate_urls",
+]
 
 
 def project_path(value: str) -> Path:
@@ -184,15 +191,68 @@ def load_jobs(path: Path) -> list[Job]:
     return jobs
 
 
+def _ranked_score(value) -> int:
+    try:
+        return int(float(str(value or "").strip()))
+    except (TypeError, ValueError):
+        return -1
+
+
+def ranked_rows_from_dashboard(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Project every Dashboard row into the stable ranked-export schema."""
+    ranked = []
+    for row in rows:
+        ranked.append({
+            "score": row.get("job_fit_score") or row.get("match_score") or "",
+            "title": row.get("title", ""),
+            "company": row.get("company", ""),
+            "location": row.get("location", ""),
+            "posted_date": row.get("posted_at", ""),
+            "salary_raw": row.get("salary_raw", ""),
+            "sponsorship_signal": row.get("sponsorship_signal", ""),
+            "summary": row.get("job_summary", ""),
+            "reason": row.get("job_fit_reason", ""),
+            "matched": row.get("matched", ""),
+            "missing": row.get("missing", ""),
+            "resume_id": row.get("resume_id", ""),
+            "resume_fit_score": row.get("resume_fit_score", ""),
+            "resume_reason": row.get("resume_reason", ""),
+            "application_mode": row.get("application_mode", ""),
+            "eligibility_reason": row.get("eligibility_reason", ""),
+            "freshness_bucket": row.get("freshness_bucket", ""),
+            "artifact_path": row.get("artifact_path", ""),
+            "source": row.get("source", ""),
+            "url": row.get("url", ""),
+            "duplicate_urls": row.get("duplicate_urls", ""),
+        })
+    ranked.sort(key=lambda row: (
+        -_ranked_score(row["score"]),
+        row["company"].casefold(),
+        row["title"].casefold(),
+        row["url"],
+    ))
+    return ranked
+
+
+def _write_ranked_rows(rows: list[dict[str, str]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=RANKED_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in RANKED_FIELDS})
+    log.info("已写入 %s", path)
+
+
+def save_ranked_from_dashboard(rows: list[dict[str, str]], path: Path) -> None:
+    """Write a complete ranking rebuilt from all persisted Dashboard rows."""
+    _write_ranked_rows(ranked_rows_from_dashboard(rows), path)
+
+
 def save_ranked(scored, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    cols = ["score", "title", "company", "location", "posted_date", "salary_raw",
-            "sponsorship_signal", "summary", "reason", "matched", "missing",
-            "resume_id", "resume_fit_score", "resume_reason", "application_mode",
-            "eligibility_reason", "freshness_bucket", "artifact_path",
-            "source", "url", "duplicate_urls"]
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=cols)
+        w = csv.DictWriter(f, fieldnames=RANKED_FIELDS)
         w.writeheader()
         for s in scored:
             j = s.job
@@ -255,6 +315,51 @@ def save_ranked_markdown(scored, path: Path) -> None:
             j = s.job
             lines.append(f"- {j.title} @ {j.company} — {j.url}({s.reason}）")
 
+    path.write_text("\n".join(lines), encoding="utf-8")
+    log.info("已写入 %s(单文档汇总,含链接和分数)", path)
+
+
+def save_ranked_markdown_from_dashboard(rows: list[dict[str, str]], path: Path) -> None:
+    """Write the complete Markdown ranking rebuilt from Dashboard rows."""
+    ranked = ranked_rows_from_dashboard(rows)
+    valid = [row for row in ranked if _ranked_score(row["score"]) >= 0]
+    failed = [row for row in ranked if _ranked_score(row["score"]) < 0]
+
+    lines = [f"# 岗位打分汇总\n", f"共 {len(ranked)} 条,{len(valid)} 条打分成功"]
+    if failed:
+        lines.append(f",{len(failed)} 条打分失败(见文末)")
+    lines.append("。\n")
+
+    for row in valid:
+        salary = row["salary_raw"] or "未列出"
+        location = row["location"] or "未列出"
+        matched = row["matched"] or "—"
+        missing = row["missing"] or "—"
+        duplicate_urls = [url for url in row["duplicate_urls"].split("; ") if url]
+        duplicate_note = ""
+        if duplicate_urls:
+            duplicate_note = f"\n- 同岗位其他链接: {' , '.join(duplicate_urls)}"
+        lines.append(f"""## {_ranked_score(row["score"])} 分 — {row["title"]} @ {row["company"]}
+
+- **链接**: {row["url"]}
+- **薪资**: {salary} · **地点**: {location} · **来源**: {row["source"]}
+- **摘要**: {row["summary"] or '(无摘要)'}
+- **匹配理由**: {row["reason"]}
+- **已满足**: {matched}
+- **待补强**: {missing}{duplicate_note}
+- **申请路径**: {row["application_mode"]} · **新鲜度**: {row["freshness_bucket"]}
+- **简历**: {row["resume_id"] or '默认简历'} ({row["resume_fit_score"] or '未计算'}/100) — {row["resume_reason"] or '—'}
+- **资格判断**: {row["eligibility_reason"] or '—'}
+""")
+
+    if failed:
+        lines.append("---\n\n## 打分失败的岗位(需人工看)\n")
+        for row in failed:
+            lines.append(
+                f"- {row['title']} @ {row['company']} — {row['url']}（{row['reason']}）"
+            )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")
     log.info("已写入 %s(单文档汇总,含链接和分数)", path)
 
@@ -400,6 +505,7 @@ def main() -> None:
         project_path(cfg["paths"].get("application_events", "data/application-events.csv")),
         freshness_config=cfg,
     )
+    dashboard.backfill_export_fields(jobs, cfg)
     run_id = uuid4().hex[:12]
     dashboard_rows = dashboard.load_rows()
     existing_job_ids = {row.get("job_id", "") for row in dashboard_rows if row.get("job_id")}
@@ -419,6 +525,12 @@ def main() -> None:
             len(jobs), touched, len(jobs_for_scoring),
         )
     if not jobs_for_scoring:
+        save_ranked_from_dashboard(
+            dashboard.load_rows(), out_dir / RANKED,
+        )
+        save_ranked_markdown_from_dashboard(
+            dashboard.load_rows(), out_dir / RANKED_MD,
+        )
         print("本轮没有新岗位需要 DeepSeek 打分；已有岗位只更新了同步时间。")
         return
 
@@ -472,11 +584,13 @@ def main() -> None:
             sponsorship_signal=s.sponsorship_signal, resume_id=s.resume_id,
             resume_fit_score=s.resume_fit_score, resume_reason=s.resume_reason,
             application_mode=s.application_mode, freshness_bucket=s.freshness_bucket,
+            salary_raw=s.job.salary_raw, matched=s.matched, missing=s.missing,
+            eligibility_reason=s.eligibility_reason,
             resume_path=s.resume_path,
             run_id=run_id, artifact_path=s.artifact_path,
         )
-    save_ranked(scored, out_dir / RANKED)
-    save_ranked_markdown(scored, out_dir / RANKED_MD)
+    save_ranked_from_dashboard(dashboard.load_rows(), out_dir / RANKED)
+    save_ranked_markdown_from_dashboard(dashboard.load_rows(), out_dir / RANKED_MD)
 
     valid = [s for s in scored if s.score >= 0]
     if valid:
@@ -512,12 +626,14 @@ def main() -> None:
                 sponsorship_signal=s.sponsorship_signal, resume_id=s.resume_id,
                 resume_fit_score=s.resume_fit_score, resume_reason=s.resume_reason,
                 application_mode=s.application_mode, freshness_bucket=s.freshness_bucket,
+                salary_raw=s.job.salary_raw, matched=s.matched, missing=s.missing,
+                eligibility_reason=s.eligibility_reason,
                 resume_path=s.resume_path,
                 run_id=run_id, artifact_path=s.artifact_path,
             )
     # 生成阶段会补上 artifact_path，重新导出让 CSV/Markdown 与 Dashboard 保持一致。
-    save_ranked(scored, out_dir / RANKED)
-    save_ranked_markdown(scored, out_dir / RANKED_MD)
+    save_ranked_from_dashboard(dashboard.load_rows(), out_dir / RANKED)
+    save_ranked_markdown_from_dashboard(dashboard.load_rows(), out_dir / RANKED_MD)
 
     if args.autopilot:
         # JobHunter prepares deterministic execution records. The current Codex Agent consumes
