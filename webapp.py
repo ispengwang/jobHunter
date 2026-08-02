@@ -137,6 +137,9 @@ USER_STATUS_LABELS = {
     "rejected": "被拒绝",
     "interview": "面试中",
 }
+DISMISSED_STATUS_LABEL = "已忽略"
+NOT_INTERESTED_REASON = "用户标记为不感兴趣"
+RESTORE_DISMISSED_REASON = "用户将岗位恢复到待审核列表"
 MODE_LABELS = {"targeted": "精准投递", "broad": "海投", "manual_review": "人工复核"}
 FRESHNESS_LABELS = {
     "within_24h": "24 小时内", "within_3d": "3 天内", "older": "较早发布", "unknown": "发布时间未知",
@@ -157,8 +160,8 @@ USER_CONFIRMED_SUBMISSION_EVIDENCE = "用户确认：外部平台已成功提交
 
 
 def _user_status(status: str) -> str:
-    """Project detailed internal execution states onto the four user-facing states."""
-    return status if status in {"submitted", "rejected", "interview"} else "ready_to_apply"
+    """Project internal execution states onto the user-facing status labels."""
+    return status if status in {"submitted", "rejected", "interview", "skipped"} else "ready_to_apply"
 
 
 def _latest_active_attempt(service: ApplicationAttempts, job_id: str) -> dict[str, str] | None:
@@ -218,8 +221,11 @@ def _dashboard_action_payload(
         "status": row.get("status", ""),
         "display_status": display_status,
         "status_label": USER_STATUS_LABELS.get(
-            display_status, STATUS_LABELS.get(display_status, display_status),
+            display_status,
+            DISMISSED_STATUS_LABEL if display_status == "skipped"
+            else STATUS_LABELS.get(display_status, display_status),
         ),
+        "dismissed": row.get("status") == "skipped",
         "submission_evidence": row.get("submission_evidence", ""),
         "submitted_at": row.get("submitted_at", ""),
         "next_action": row.get("next_action", ""),
@@ -427,6 +433,10 @@ def _unified_dashboard_rows(
             row["title"] = clean_seek_title(row.get("title", ""))
         status = row.get("status") or "review"
         display_status = _user_status(status)
+        status_label = USER_STATUS_LABELS.get(
+            display_status, DISMISSED_STATUS_LABEL if display_status == "skipped"
+            else STATUS_LABELS.get(display_status, display_status),
+        )
         freshness = (
             freshness_bucket(
                 row.get("posted_at"), freshness_config, now,
@@ -462,7 +472,7 @@ def _unified_dashboard_rows(
             "score_label": f"{score} 分" if score >= 0 else "待人工评分",
             "score_class": "high" if score >= 80 else "mid" if score >= 60 else "low",
             "display_status": display_status,
-            "status_label": USER_STATUS_LABELS[display_status],
+            "status_label": status_label,
             "mode_label": MODE_LABELS.get(row.get("application_mode", ""), row.get("application_mode") or "人工复核"),
             "freshness_label": FRESHNESS_LABELS.get(freshness, freshness),
             "freshness_bucket": freshness,
@@ -1174,6 +1184,8 @@ DASHBOARD_HTML = """
     <span class="hint">最近同步 {{ latest_sync_count }} 条 · {{ latest_sync_display }}{% if latest_run_id %} · 批次 {{ latest_run_id }}{% endif %}</span>
     <button type="button" class="btn" onclick="setQueue('latest', document.querySelector('[data-v=latest]'))">查看最近同步</button>
     <button type="button" class="btn" onclick="setSeg('freshness', 'within_24h', document.querySelector('[data-v=within_24h]'))">只看 24h</button>
+    {% if show_dismissed %}<a class="btn" href="{{ url_for('dashboard_view') }}">返回工作机会</a>
+    {% else %}<a class="btn" id="dismissed-link" href="{{ url_for('dashboard_view', view='dismissed') }}"{% if not dismissed_count %} hidden{% endif %}>已忽略 <span id="dismissed-count">{{ dismissed_count }}</span> 个</a>{% endif %}
   </div>
 </div>
 
@@ -1183,7 +1195,7 @@ DASHBOARD_HTML = """
 </div>
 
 {% if not rows %}
-<p class="empty">还没有 Dashboard 记录 —— 先在设置面板运行“抓取 + 打分”。</p>
+<p class="empty">{% if show_dismissed %}暂无已忽略岗位。<a href="{{ url_for('dashboard_view') }}">返回工作机会</a>{% else %}当前列表没有工作机会 —— 先在设置面板运行“抓取 + 打分”，或查看已忽略岗位。{% endif %}</p>
 {% else %}
 <div class="filters">
   <div class="filter-row">
@@ -1206,7 +1218,7 @@ DASHBOARD_HTML = """
   </div>
 </div>
 
-<div class="section-heading"><div><h2>工作机会</h2><p>按匹配分降序排列；状态和历史保留在同一张卡片里。</p></div><span class="count" id="count-secondary"></span></div>
+<div class="section-heading"><div><h2>{% if show_dismissed %}已忽略岗位{% else %}工作机会{% endif %}</h2><p>{% if show_dismissed %}这些岗位不会出现在默认列表中；需要时可以恢复到待审核。{% else %}按匹配分降序排列；状态和历史保留在同一张卡片里。{% endif %}</p></div><span class="count" id="count-secondary"></span></div>
 <div id="rows">
 {% for r in rows %}
 {% set sig = r.sponsorship_signal or 'unknown' %}
@@ -1228,6 +1240,20 @@ DASHBOARD_HTML = """
   <div class="tags">{% for m in (r.matched or '').split(',') if m.strip() %}<span class="tag m">{{ m.strip() }}</span>{% endfor %}{% for x in (r.missing or '').split(',') if x.strip() %}<span class="tag x">缺 {{ x.strip() }}</span>{% endfor %}</div>
   <div class="card-actions"><a href="{{ r.url }}" target="_blank" rel="noopener">打开岗位链接 →</a><a href="{{ url_for('dashboard_detail', job_id=r.job_id) }}">查看详情与历史 →</a><span class="meta" data-next-action{% if not r.next_action %} hidden{% endif %}>{% if r.next_action %}下一步：{{ r.next_action }}{% endif %}</span></div>
   <div class="status-tools">
+    {% if r.status == 'skipped' %}
+    <form method="post" action="{{ url_for('dashboard_restore', job_id=r.job_id) }}" data-restore-dismissed onsubmit="return restoreDismissed(event, this)">
+      <input type="hidden" name="action_token" value="{{ action_token }}">
+      <input type="hidden" name="return_to" value="dashboard">
+      <button class="btn primary" type="submit">恢复到工作机会</button>
+    </form>
+    {% else %}
+    {% if r.status not in ['submitted', 'follow_up', 'rejected', 'interview', 'withdrawn'] %}
+    <form method="post" action="{{ url_for('dashboard_dismiss', job_id=r.job_id) }}" data-not-interested onsubmit="return dismissJob(event, this)">
+      <input type="hidden" name="action_token" value="{{ action_token }}">
+      <input type="hidden" name="return_to" value="dashboard">
+      <button class="btn" type="submit">不想要</button>
+    </form>
+    {% endif %}
     <form method="post" action="{{ url_for('confirm_submitted', job_id=r.job_id) }}"
       data-confirm-submitted onsubmit="return confirmSubmitted(event, this)"{% if r.display_status != 'ready_to_apply' %} hidden{% endif %}>
       <input type="hidden" name="action_token" value="{{ action_token }}">
@@ -1240,6 +1266,7 @@ DASHBOARD_HTML = """
       data-current="{{ r.display_status }}"
       data-evidence="{{ r.submission_evidence }}"
       onclick="openStatusDialog(this)">转换申请状态</button>
+    {% endif %}
   </div>
   {% if r.application_mode == 'manual_review' %}
   <div class="apply-panel"><span class="action-lock">当前规则要求人工复核职位级别或资格后才能投递。</span></div>
@@ -1309,6 +1336,7 @@ const freshnessPriorityHours = {{ freshness_priority_hours }};
 const freshnessRecentHours = {{ freshness_recent_hours }};
 const freshnessLabels = {within_24h:'24 小时内', within_3d:'3 天内', older:'较早发布', unknown:'发布时间未知'};
 const pageSize = 40;
+let dashboardTotal = {{ rows|length }};
 let visibleLimit = pageSize;
 let statusTrigger = null;
 function syncRange(){document.getElementById('min-score').value=document.getElementById('min-range').value;filterRows(true);}
@@ -1330,7 +1358,7 @@ function filterRows(resetLimit=false){
   });
   const shown=Math.min(visibleLimit,matches.length);
   matches.slice(0,shown).forEach(el=>{el.style.display='';});
-  document.getElementById('count').textContent='显示 '+shown+' / '+matches.length+' 条匹配（共 {{ rows|length }} 条）';
+  document.getElementById('count').textContent='显示 '+shown+' / '+matches.length+' 条匹配（共 '+dashboardTotal+' 条）';
   document.getElementById('count-secondary').textContent=matches.length+' 条匹配';
   document.getElementById('no-match').style.display=matches.length===0?'':'none';
   const loadMore=document.getElementById('load-more');
@@ -1415,7 +1443,7 @@ function updateStatusDialog(){
   reason.placeholder=returning?'请说明为什么重新进入待投递':'例如：收到面试邀请';
   document.getElementById('status-save').disabled=same;
 }
-const statusStatIds={ready_to_apply:'stat-ready-to-apply',submitted:'stat-submitted',rejected:'stat-rejected',interview:'stat-interview'};
+const statusStatIds={total:'stat-total',within_24h:'stat-within-24h',ready_to_apply:'stat-ready-to-apply',submitted:'stat-submitted',rejected:'stat-rejected',interview:'stat-interview'};
 function changeStat(status,delta){
   const target=document.getElementById(statusStatIds[status]);
   if(!target)return;
@@ -1491,6 +1519,54 @@ async function confirmSubmitted(event,form){
     const data=await postDashboardAction(form);
     updateCardFromAction(data,form);
     form.hidden=true;
+  }catch(error){
+    showCardActionError(card,error.message);
+    button.disabled=false;
+  }
+  return false;
+}
+function removeCardFromDashboard(card, previousStatus, wasFresh){
+  if(!card)return;
+  dashboardTotal=Math.max(0,dashboardTotal-1);
+  const dismissedLink=document.getElementById('dismissed-link');
+  const dismissedCount=document.getElementById('dismissed-count');
+  if(dismissedLink&&dismissedCount){
+    dismissedCount.textContent=String(parseInt(dismissedCount.textContent||'0',10)+1);
+    dismissedLink.hidden=false;
+  }
+  changeStat('total',-1);
+  if(wasFresh)changeStat('within_24h',-1);
+  if(statusStatIds[previousStatus])changeStat(previousStatus,-1);
+  card.remove();
+  filterRows();
+}
+async function dismissJob(event,form){
+  event.preventDefault();
+  const card=form.closest('.row-item');
+  const title=card&&card.querySelector('.row-title')?card.querySelector('.row-title').textContent.trim():'这个岗位';
+  if(!window.confirm('确定将“'+title+'”标记为不想要？它会从默认列表中移除。'))return false;
+  const button=form.querySelector('button');
+  clearCardActionError(card);
+  button.disabled=true;
+  try{
+    const data=await postDashboardAction(form);
+    if(!data.dismissed)throw new Error('服务器未确认岗位已移除');
+    removeCardFromDashboard(card,card.dataset.status,card.dataset.freshness==='within_24h');
+  }catch(error){
+    showCardActionError(card,error.message);
+    button.disabled=false;
+  }
+  return false;
+}
+async function restoreDismissed(event,form){
+  event.preventDefault();
+  const card=form.closest('.row-item');
+  const button=form.querySelector('button');
+  clearCardActionError(card);
+  button.disabled=true;
+  try{
+    await postDashboardAction(form);
+    removeCardFromDashboard(card,card.dataset.status,false);
   }catch(error){
     showCardActionError(card,error.message);
     button.disabled=false;
@@ -1666,6 +1742,12 @@ def dashboard_view():
     cfg = load_config()
     board = _dashboard(cfg)
     raw_rows = board.load_rows()
+    show_dismissed = request.args.get("view") == "dismissed"
+    dismissed_count = sum(1 for row in raw_rows if row.get("status") == "skipped")
+    visible_raw_rows = [
+        row for row in raw_rows
+        if (row.get("status") == "skipped") == show_dismissed
+    ]
     queues = board.daily_queues()
     timezone_name = str(
         cfg.get("applypilot", {}).get("timezone", "Australia/Melbourne")
@@ -1684,7 +1766,7 @@ def dashboard_view():
             attempts_by_job[job_id] = attempt
     ranked_path = _project_path(cfg.get("paths", {}).get("output_dir", "output")) / "jobs-ranked.csv"
     rows = _unified_dashboard_rows(
-        raw_rows, today_ids, attempts_by_job,
+        visible_raw_rows, today_ids, attempts_by_job,
         timezone_name=timezone_name,
         freshness_config=cfg,
         latest_run_id=latest_run_id,
@@ -1722,6 +1804,7 @@ def dashboard_view():
         status_labels=USER_STATUS_LABELS,
         latest_run_id=latest_run_id, latest_sync_display=latest_sync_display,
         latest_sync_count=latest_sync_count,
+        show_dismissed=show_dismissed, dismissed_count=dismissed_count,
         freshness_priority_hours=int(
             cfg.get("application", {}).get("priority_within_hours", 24)
         ),
@@ -1797,9 +1880,11 @@ def dashboard_detail(job_id: str):
     platform_mode = platform_submission_mode(
         row.get("source", ""), row.get("url", ""), cfg,
     )
+    detail_statuses = USER_STATUSES + (("skipped",) if row.get("status") == "skipped" else ())
+    detail_status_labels = {**USER_STATUS_LABELS, "skipped": DISMISSED_STATUS_LABEL}
     return render_template_string(
         DASHBOARD_DETAIL_HTML, row=row, events=board.events_for(job_id),
-        statuses=USER_STATUSES, status_labels=USER_STATUS_LABELS, attempt=attempt,
+        statuses=detail_statuses, status_labels=detail_status_labels, attempt=attempt,
         action_token=ACTION_TOKEN,
         platform_mode_label=PLATFORM_MODE_LABELS.get(platform_mode, platform_mode),
     )
@@ -1836,10 +1921,10 @@ def dashboard_transition(job_id: str):
         current_display_status = _user_status(row.get("status", ""))
         if (
             status == "ready_to_apply"
-            and current_display_status in {"submitted", "rejected", "interview"}
+            and current_display_status in {"submitted", "rejected", "interview", "skipped"}
             and not reason
         ):
-            raise ValueError("将已提交、被拒绝或面试中的岗位改回待投递时，必须填写原因")
+            raise ValueError("将已忽略、已提交、被拒绝或面试中的岗位改回待投递时，必须填写原因")
 
         default_next_actions = {
             "ready_to_apply": "继续或重新开始投递",
@@ -1869,6 +1954,91 @@ def dashboard_transition(job_id: str):
     if wants_json:
         return jsonify(_dashboard_action_payload(
             board, service, job_id, message="状态已更新",
+        ))
+    if return_to_dashboard:
+        return redirect(url_for("dashboard_view", saved="1"))
+    return redirect(url_for("dashboard_detail", job_id=job_id))
+
+
+@app.route("/dashboard/<job_id>/dismiss", methods=["POST"])
+@app.route("/dashboard/<job_id>/not-interested", methods=["POST"])
+def dashboard_dismiss(job_id: str):
+    wants_json = "application/json" in request.headers.get("Accept", "")
+    supplied_token = request.form.get("action_token", "")
+    if not supplied_token or not hmac.compare_digest(supplied_token, ACTION_TOKEN):
+        if wants_json:
+            return jsonify({"ok": False, "error": "操作请求已失效，请刷新 Dashboard 后重试。"}), 403
+        return "操作请求已失效，请刷新 Dashboard 后重试。", 403
+
+    cfg = load_config()
+    board = _dashboard(cfg)
+    service = _attempts(cfg)
+    return_to_dashboard = request.form.get("return_to") == "dashboard"
+    try:
+        row = board.get(job_id)
+        if row is None:
+            raise KeyError(f"Dashboard 中找不到岗位: {job_id}")
+        if row.get("status") == "skipped":
+            raise ValueError("该岗位已经在已忽略列表中")
+        if row.get("status") in {"submitted", "follow_up", "rejected", "interview", "withdrawn"}:
+            raise ValueError("已进入申请历史的岗位不能标记为不想要")
+
+        active_attempt_statuses = {
+            "selected", "queued", "browser_opened", "filling", "needs_user", "ready_to_submit",
+        }
+        for attempt in service.load_rows():
+            if attempt.get("job_id") != job_id or attempt.get("status") not in active_attempt_statuses:
+                continue
+            service.advance(
+                attempt["attempt_id"], "cancelled", actor="user", reason=NOT_INTERESTED_REASON,
+            )
+        board.transition(
+            job_id, "skipped", actor="user", reason=NOT_INTERESTED_REASON,
+            next_action="如需恢复，可从已忽略列表恢复",
+        )
+    except (KeyError, ValueError) as exc:
+        if wants_json:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        return redirect(url_for("dashboard_view", error=str(exc)))
+    if wants_json:
+        return jsonify(_dashboard_action_payload(
+            board, service, job_id, message="已标记为不想要，并从默认列表移除",
+        ))
+    if return_to_dashboard:
+        return redirect(url_for("dashboard_view", saved="1"))
+    return redirect(url_for("dashboard_detail", job_id=job_id))
+
+
+@app.route("/dashboard/<job_id>/restore", methods=["POST"])
+def dashboard_restore(job_id: str):
+    wants_json = "application/json" in request.headers.get("Accept", "")
+    supplied_token = request.form.get("action_token", "")
+    if not supplied_token or not hmac.compare_digest(supplied_token, ACTION_TOKEN):
+        if wants_json:
+            return jsonify({"ok": False, "error": "操作请求已失效，请刷新 Dashboard 后重试。"}), 403
+        return "操作请求已失效，请刷新 Dashboard 后重试。", 403
+
+    cfg = load_config()
+    board = _dashboard(cfg)
+    return_to_dashboard = request.form.get("return_to") == "dashboard"
+    try:
+        row = board.get(job_id)
+        if row is None:
+            raise KeyError(f"Dashboard 中找不到岗位: {job_id}")
+        if row.get("status") != "skipped":
+            raise ValueError("当前岗位不在已忽略列表中")
+        board.transition(
+            job_id, "review", actor="user", reason=RESTORE_DISMISSED_REASON,
+            next_action="Review recommendation",
+        )
+    except (KeyError, ValueError) as exc:
+        if wants_json:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        return redirect(url_for("dashboard_view", error=str(exc)))
+    service = _attempts(cfg)
+    if wants_json:
+        return jsonify(_dashboard_action_payload(
+            board, service, job_id, message="岗位已恢复到工作机会列表",
         ))
     if return_to_dashboard:
         return redirect(url_for("dashboard_view", saved="1"))
@@ -2137,4 +2307,5 @@ if __name__ == "__main__":
     print("浏览器打开: http://127.0.0.1:5050")
     print("Ctrl+C 停止")
     print("=" * 60)
-    app.run(host="127.0.0.1", port=5050, debug=False, threaded=True)
+    # 本地开发开启 Flask 自动重载；服务仍只绑定本机地址。
+    app.run(host="127.0.0.1", port=5050, debug=True, use_reloader=True, threaded=True)

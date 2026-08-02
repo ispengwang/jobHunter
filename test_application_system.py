@@ -551,6 +551,29 @@ try:
     webapp.CONFIG_PATH = app_cfg_path
     try:
         client = webapp.app.test_client()
+        dismiss_job = Job(
+            "seek", "Junior Not Interested", "DismissCo", "https://example.test/jobs/dismiss",
+            posted_date=job.posted_date, description="Junior product engineering role.",
+        )
+        dashboard.upsert_recommendation(
+            dismiss_job, job_fit_score=77, job_fit_reason="测试不感兴趣操作",
+            job_summary="用于验证不想要按钮", sponsorship_signal="unknown",
+            resume_id=selection.resume_id, resume_fit_score=selection.fit_score,
+            resume_reason=selection.reason, application_mode="targeted",
+            freshness_bucket="within_24h", resume_path=str(selection.path), run_id="dismiss-run",
+        )
+        dismiss_attempt = attempts.create(dismiss_job.id, reloaded, profile_path)
+        restore_job = Job(
+            "seek", "Junior Restore Me", "RestoreCo", "https://example.test/jobs/restore",
+            posted_date=job.posted_date, description="Manual review role for restore testing.",
+        )
+        dashboard.upsert_recommendation(
+            restore_job, job_fit_score=71, job_fit_reason="测试恢复操作",
+            job_summary="用于验证恢复入口", sponsorship_signal="unknown",
+            resume_id=selection.resume_id, resume_fit_score=selection.fit_score,
+            resume_reason=selection.reason, application_mode="manual_review",
+            freshness_bucket="within_24h", resume_path=str(selection.path), run_id="dismiss-run",
+        )
         check(
             "Dashboard 可解析评分维度权重",
             webapp._extract_score_dimensions("| Role fit | 0–30 |"),
@@ -562,6 +585,9 @@ try:
         check("评分规则页面显示完整 Skill 规则", "Stable rules" in rules_page.get_data(as_text=True))
         check("Dashboard 页面可打开", client.get("/dashboard").status_code, 200)
         dashboard_html = client.get("/dashboard").get_data(as_text=True)
+        check("Dashboard 显示不想要按钮", "不想要" in dashboard_html)
+        check("Dashboard 不想要按钮使用受保护路由", f"/dashboard/{dismiss_job.id}/not-interested" in dashboard_html)
+        check("Dashboard 显示恢复入口", f"/dashboard/{restore_job.id}/not-interested" in dashboard_html)
         check("Dashboard 显示最近同步入口", "最近同步" in dashboard_html)
         check("Dashboard 提供最近同步筛选", 'data-v="latest"' in dashboard_html)
         check("Dashboard 页面禁止缓存", client.get("/dashboard").headers.get("Cache-Control"), "no-store, max-age=0")
@@ -622,6 +648,61 @@ try:
             "status": "review", "freshness_bucket": "unknown",
         }], set(), {})
         check("未评分岗位在最低分 -1 时仍可见", unscored_rows[0]["score_int"], "-1")
+
+        missing_dismiss_token = client.post(
+            f"/dashboard/{dismiss_job.id}/not-interested",
+            headers={"Accept": "application/json"},
+        )
+        check("不想要操作需要页面动作令牌", missing_dismiss_token.status_code, 403)
+        dismissed_response = client.post(
+            f"/dashboard/{dismiss_job.id}/not-interested",
+            data={"action_token": webapp.ACTION_TOKEN},
+            headers={"Accept": "application/json"},
+        )
+        dismissed_payload = dismissed_response.get_json()
+        check("点击不想要返回成功", dismissed_response.status_code, 200)
+        check("不想要响应确认岗位已隐藏", dismissed_payload["dismissed"], True)
+        dismissed_row = webapp._dashboard(webapp.load_config()).get(dismiss_job.id)
+        check("不想要持久化为 skipped", dismissed_row["status"], "skipped")
+        check("不想要写入固定原因", dismissed_row["skip_reason"], webapp.NOT_INTERESTED_REASON)
+        check("不想要追加状态事件", any(
+            event.get("to_status") == "skipped"
+            and event.get("reason") == webapp.NOT_INTERESTED_REASON
+            for event in webapp._dashboard(webapp.load_config()).events_for(dismiss_job.id)
+        ))
+        check("不想要取消未提交的内部尝试", webapp._attempts(webapp.load_config()).get(
+            dismiss_attempt["attempt_id"]
+        )["status"], "cancelled")
+        dashboard.upsert_recommendation(
+            dismiss_job, job_fit_score=78, job_fit_reason="重新同步测试",
+            job_summary="重新同步不应恢复岗位", sponsorship_signal="unknown",
+            resume_id=selection.resume_id, resume_fit_score=selection.fit_score,
+            resume_reason=selection.reason, application_mode="targeted",
+            freshness_bucket="within_24h", resume_path=str(selection.path), run_id="dismiss-rerun",
+        )
+        check("重新同步不会恢复不想要岗位", dashboard.get(dismiss_job.id)["status"], "skipped")
+        default_after_dismiss = client.get("/dashboard").get_data(as_text=True)
+        check("不想要岗位不再出现在默认列表", dismiss_job.title in default_after_dismiss, False)
+        dismissed_view = client.get("/dashboard?view=dismissed").get_data(as_text=True)
+        check("可查看已忽略岗位", dismiss_job.title in dismissed_view)
+        check("已忽略视图显示恢复路由", f"/dashboard/{dismiss_job.id}/restore" in dismissed_view)
+
+        restore_dismissed_response = client.post(
+            f"/dashboard/{restore_job.id}/not-interested",
+            data={"action_token": webapp.ACTION_TOKEN},
+            headers={"Accept": "application/json"},
+        )
+        check("第二个岗位也可标记为不想要", restore_dismissed_response.status_code, 200)
+
+        restored_response = client.post(
+            f"/dashboard/{restore_job.id}/restore",
+            data={"action_token": webapp.ACTION_TOKEN},
+            headers={"Accept": "application/json"},
+        )
+        restored_payload = restored_response.get_json()
+        check("恢复岗位返回成功", restored_response.status_code, 200)
+        check("恢复岗位返回待投递展示状态", restored_payload["display_status"], "ready_to_apply")
+        check("恢复岗位写回 review", webapp._dashboard(webapp.load_config()).get(restore_job.id)["status"], "review")
 
         missing_status_token = client.post(
             f"/dashboard/{linked_in.id}/transition",
