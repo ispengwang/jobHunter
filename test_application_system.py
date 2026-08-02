@@ -585,6 +585,11 @@ try:
         check("Dashboard 显示加入投递清单按钮", "加入投递清单" in dashboard_html)
         check("Dashboard 不启动后台 ApplyPilot", "直接启动 ApplyPilot" in dashboard_html, False)
         check("Dashboard 显示确认已提交入口", "确认已提交" in dashboard_html)
+        check("Dashboard 确认已提交使用一键 POST", "/confirm-submitted" in dashboard_html)
+        check("Dashboard 确认已提交不打开额外弹窗", "openStatusDialog(this,'confirm')" in dashboard_html, False)
+        check("Dashboard 确认提交使用局部请求", "confirmSubmitted(event, this)" in dashboard_html)
+        check("Dashboard 状态转换使用局部请求", "saveStatus(event, this)" in dashboard_html)
+        check("Dashboard 卡片状态可局部更新", "data-status-chip" in dashboard_html)
         check("Dashboard 保留状态转换入口", "转换申请状态" in dashboard_html)
         check("Dashboard 状态编辑只渲染一个共享表单", dashboard_html.count('id="status-form"'), 1)
         check("Dashboard 不再为每张卡片渲染 details 表单", "<details" in dashboard_html, False)
@@ -656,6 +661,8 @@ try:
         linked_attempt = webapp._attempts(webapp.load_config()).get(manual_payload["attempt_id"])
         check("点击按钮不代表资料外发授权", linked_attempt["data_transmission_confirmed"], "")
         check("点击按钮只创建 selected 记录", linked_attempt["status"], "selected")
+        missing_confirm_token = client.post(f"/dashboard/{linked_in.id}/confirm-submitted")
+        check("一键确认提交需要页面动作令牌", missing_confirm_token.status_code, 403)
         missing_evidence = client.post(
             f"/dashboard/{linked_in.id}/transition",
             data={
@@ -672,20 +679,21 @@ try:
             "ready_to_apply",
         )
         confirmed_submission = client.post(
-            f"/dashboard/{linked_in.id}/transition",
-            data={
-                "action_token": webapp.ACTION_TOKEN,
-                "return_to": "dashboard",
-                "status": "submitted",
-                "submission_confirmed": "on",
-                "submission_evidence": "Application received · confirmation AU-123",
-            },
+            f"/dashboard/{linked_in.id}/confirm-submitted",
+            data={"action_token": webapp.ACTION_TOKEN, "return_to": "dashboard"},
+            headers={"Accept": "application/json"},
         )
-        check("用户可从 Dashboard 确认已提交", confirmed_submission.status_code, 302)
+        confirmed_payload = confirmed_submission.get_json()
+        check("用户可从 Dashboard 一键确认已提交", confirmed_submission.status_code, 200)
+        check("一键确认返回局部更新数据", confirmed_payload["display_status"], "submitted")
         confirmed_row = webapp._dashboard(webapp.load_config()).get(linked_in.id)
         check("确认提交写入主状态", confirmed_row["status"], "submitted")
         check("确认提交写入时间", bool(confirmed_row["submitted_at"]))
-        check("确认提交保存证据", confirmed_row["submission_evidence"], "Application received · confirmation AU-123")
+        check(
+            "一键确认自动保存用户确认标记",
+            confirmed_row["submission_evidence"],
+            webapp.USER_CONFIRMED_SUBMISSION_EVIDENCE,
+        )
         confirmed_attempt = webapp._attempts(webapp.load_config()).get(manual_payload["attempt_id"])
         check("确认提交同步内部 attempt", confirmed_attempt["status"], "submitted")
         converted_status = client.post(
@@ -696,11 +704,18 @@ try:
                 "status": "interview",
                 "reason": "收到第一轮面试邀请",
             },
+            headers={"Accept": "application/json"},
         )
-        check("用户可转换申请状态", converted_status.status_code, 302)
+        converted_payload = converted_status.get_json()
+        check("用户可局部转换申请状态", converted_status.status_code, 200)
+        check("状态转换返回局部更新数据", converted_payload["display_status"], "interview")
         converted_row = webapp._dashboard(webapp.load_config()).get(linked_in.id)
         check("状态转换写入面试中", converted_row["status"], "interview")
-        check("状态转换保留提交证据", converted_row["submission_evidence"], "Application received · confirmation AU-123")
+        check(
+            "状态转换保留提交证据",
+            converted_row["submission_evidence"],
+            webapp.USER_CONFIRMED_SUBMISSION_EVIDENCE,
+        )
 
         automatic_start = client.post(
             f"/dashboard/{second_seek.id}/applypilot",

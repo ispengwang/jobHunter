@@ -152,9 +152,80 @@ PLATFORM_MODE_LABELS = {
     "assisted": "Agent 辅助填写，最终由你提交",
     "auto_if_allowed": "ApplyPilot 核验后可自动",
 }
+USER_CONFIRMED_SUBMISSION_REASON = "用户确认外部平台已成功提交"
+USER_CONFIRMED_SUBMISSION_EVIDENCE = "用户确认：外部平台已成功提交（Dashboard 一键确认）"
+
+
 def _user_status(status: str) -> str:
     """Project detailed internal execution states onto the four user-facing states."""
     return status if status in {"submitted", "rejected", "interview"} else "ready_to_apply"
+
+
+def _latest_active_attempt(service: ApplicationAttempts, job_id: str) -> dict[str, str] | None:
+    attempts = [
+        attempt for attempt in service.load_rows()
+        if attempt.get("job_id") == job_id
+        and attempt.get("status") not in {"cancelled", "failed"}
+    ]
+    return max(attempts, key=lambda item: item.get("updated_at", ""), default=None)
+
+
+def _record_submitted(
+    board: Dashboard,
+    service: ApplicationAttempts,
+    job_id: str,
+    *,
+    reason: str,
+    submission_confirmed: bool,
+    submission_evidence: str,
+    next_action: str | None = None,
+    notes: str | None = None,
+) -> dict[str, str]:
+    """Write a confirmed submission through the Dashboard and active attempt together."""
+    latest_attempt = _latest_active_attempt(service, job_id)
+    if latest_attempt and latest_attempt.get("status") != "submitted":
+        return service.advance(
+            latest_attempt["attempt_id"], "submitted", actor="user",
+            reason=reason, submission_confirmed=submission_confirmed,
+            submission_evidence=submission_evidence,
+            next_action=next_action, notes=notes,
+        )
+    return board.transition(
+        job_id, "submitted", actor="user", reason=reason,
+        next_action=next_action, notes=notes,
+        submission_confirmed=submission_confirmed,
+        submission_evidence=submission_evidence,
+    )
+
+
+def _dashboard_action_payload(
+    board: Dashboard,
+    service: ApplicationAttempts,
+    job_id: str,
+    *,
+    message: str,
+) -> dict[str, str | bool]:
+    row = board.get(job_id)
+    if row is None:
+        raise KeyError(f"Dashboard 中找不到岗位: {job_id}")
+    display_status = _user_status(row.get("status", ""))
+    attempt = _latest_active_attempt(service, job_id)
+    attempt_status = (attempt or {}).get("status", "")
+    return {
+        "ok": True,
+        "message": message,
+        "job_id": job_id,
+        "status": row.get("status", ""),
+        "display_status": display_status,
+        "status_label": USER_STATUS_LABELS.get(
+            display_status, STATUS_LABELS.get(display_status, display_status),
+        ),
+        "submission_evidence": row.get("submission_evidence", ""),
+        "submitted_at": row.get("submitted_at", ""),
+        "next_action": row.get("next_action", ""),
+        "attempt_status": attempt_status,
+        "attempt_status_label": ATTEMPT_LABELS.get(attempt_status, attempt_status),
+    }
 
 
 def _format_posted_at(value: str, timezone_name: str) -> tuple[str, str]:
@@ -1047,12 +1118,14 @@ DASHBOARD_HTML = """
   .tags { margin-top:7px; display:flex; gap:6px; flex-wrap:wrap; }.tag { font-size:11px; padding:1px 7px; border-radius:5px; }.tag.m { background:var(--success-bg); color:var(--success-text); }.tag.x { background:var(--bg); color:var(--text-dim); border:1px solid var(--border); }
   .card-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:12px; }.card-actions a { font-size:12.5px; color:var(--accent); }
   .status-tools { display:flex; align-items:center; gap:9px; flex-wrap:wrap; margin-top:12px; padding-top:12px; border-top:1px solid var(--border); }
+  .status-tools form { margin:0; }
   .status-form { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:9px 12px; }
   .status-form label { margin:0; font-size:11.5px; color:var(--text-dim); }
   .status-form input, .status-form select, .status-form textarea { margin-top:4px; }
   .status-form .full { grid-column:1 / -1; }
   .status-form .checks { margin:0; }.status-form .checks label { color:var(--text); }
   .status-form-actions { display:flex; align-items:center; gap:8px; grid-column:1 / -1; }
+  .action-error { color:var(--danger-text); font-size:12.5px; margin:0; }
   .submission-fields[hidden] { display:none; }
   .status-modal[hidden] { display:none; }
   .status-modal { position:fixed; inset:0; z-index:50; display:grid; place-items:center; padding:18px;
@@ -1087,12 +1160,12 @@ DASHBOARD_HTML = """
 {% if saved %}<div class="flash">状态已更新，并已写入操作事件。</div>{% endif %}
 {% if error %}<div class="card"><h2>无法更新状态</h2><p class="hint">{{ error }}</p></div>{% endif %}
 <div class="stats">
-  <div class="stat"><div class="n">{{ stats.total }}</div><div class="k">全部机会</div></div>
-  <div class="stat high"><div class="n">{{ stats.within_24h }}</div><div class="k">24h 内发布</div></div>
-  <div class="stat"><div class="n">{{ stats.ready_to_apply }}</div><div class="k">待投递</div></div>
-  <div class="stat high"><div class="n">{{ stats.submitted }}</div><div class="k">已提交</div></div>
-  <div class="stat danger"><div class="n">{{ stats.rejected }}</div><div class="k">被拒绝</div></div>
-  <div class="stat mid"><div class="n">{{ stats.interview }}</div><div class="k">面试中</div></div>
+  <div class="stat"><div class="n" id="stat-total">{{ stats.total }}</div><div class="k">全部机会</div></div>
+  <div class="stat high"><div class="n" id="stat-within-24h">{{ stats.within_24h }}</div><div class="k">24h 内发布</div></div>
+  <div class="stat"><div class="n" id="stat-ready-to-apply">{{ stats.ready_to_apply }}</div><div class="k">待投递</div></div>
+  <div class="stat high"><div class="n" id="stat-submitted">{{ stats.submitted }}</div><div class="k">已提交</div></div>
+  <div class="stat danger"><div class="n" id="stat-rejected">{{ stats.rejected }}</div><div class="k">被拒绝</div></div>
+  <div class="stat mid"><div class="n" id="stat-interview">{{ stats.interview }}</div><div class="k">面试中</div></div>
 </div>
 
 <div class="today-banner">
@@ -1142,7 +1215,7 @@ DASHBOARD_HTML = """
     <span class="badge {{ r.score_class }}">{{ r.score_label }}</span>
     <span class="row-title"><a href="{{ url_for('dashboard_detail', job_id=r.job_id) }}">{{ r.title }}</a></span>
     <span class="row-company">@ {{ r.company }}</span>
-    <span class="chip accent">{{ r.status_label }}</span>
+    <span class="chip accent" data-status-chip>{{ r.status_label }}</span>
     <span class="chip">{{ r.mode_label }}</span>
     <span class="chip" data-freshness-chip="1">{{ r.freshness_label }}</span>
     {% if sig == 'explicit_yes' %}<span class="chip yes">可担保</span>{% elif sig == 'explicit_no' %}<span class="chip no">不担保</span>{% else %}<span class="chip unknown">担保未提及</span>{% endif %}
@@ -1153,22 +1226,20 @@ DASHBOARD_HTML = """
   <div class="score-detail"><b>评分理由：</b>{{ r.reason or '暂无匹配理由，需人工复核。' }}</div>
   <div class="score-detail">简历匹配：{{ r.resume_fit_score or '—' }}/100{% if r.resume_reason %} · {{ r.resume_reason }}{% endif %}{% if r.eligibility_reason %} · {{ r.eligibility_reason }}{% endif %}</div>
   <div class="tags">{% for m in (r.matched or '').split(',') if m.strip() %}<span class="tag m">{{ m.strip() }}</span>{% endfor %}{% for x in (r.missing or '').split(',') if x.strip() %}<span class="tag x">缺 {{ x.strip() }}</span>{% endfor %}</div>
-  <div class="card-actions"><a href="{{ r.url }}" target="_blank" rel="noopener">打开岗位链接 →</a><a href="{{ url_for('dashboard_detail', job_id=r.job_id) }}">查看详情与历史 →</a>{% if r.next_action %}<span class="meta">下一步：{{ r.next_action }}</span>{% endif %}</div>
+  <div class="card-actions"><a href="{{ r.url }}" target="_blank" rel="noopener">打开岗位链接 →</a><a href="{{ url_for('dashboard_detail', job_id=r.job_id) }}">查看详情与历史 →</a><span class="meta" data-next-action{% if not r.next_action %} hidden{% endif %}>{% if r.next_action %}下一步：{{ r.next_action }}{% endif %}</span></div>
   <div class="status-tools">
-    {% if r.display_status == 'ready_to_apply' %}
-    <button type="button" class="btn primary status-action"
-      data-action="{{ url_for('dashboard_transition', job_id=r.job_id) }}"
-      data-title="{{ r.title }} @ {{ r.company }}"
-      data-current="{{ r.display_status }}"
-      data-evidence="{{ r.submission_evidence }}"
-      onclick="openStatusDialog(this,'confirm')">确认已提交</button>
-    {% endif %}
+    <form method="post" action="{{ url_for('confirm_submitted', job_id=r.job_id) }}"
+      data-confirm-submitted onsubmit="return confirmSubmitted(event, this)"{% if r.display_status != 'ready_to_apply' %} hidden{% endif %}>
+      <input type="hidden" name="action_token" value="{{ action_token }}">
+      <input type="hidden" name="return_to" value="dashboard">
+      <button class="btn primary" type="submit">确认已提交</button>
+    </form>
     <button type="button" class="btn status-action"
       data-action="{{ url_for('dashboard_transition', job_id=r.job_id) }}"
       data-title="{{ r.title }} @ {{ r.company }}"
       data-current="{{ r.display_status }}"
       data-evidence="{{ r.submission_evidence }}"
-      onclick="openStatusDialog(this,'change')">转换申请状态</button>
+      onclick="openStatusDialog(this)">转换申请状态</button>
   </div>
   {% if r.application_mode == 'manual_review' %}
   <div class="apply-panel"><span class="action-lock">当前规则要求人工复核职位级别或资格后才能投递。</span></div>
@@ -1178,7 +1249,7 @@ DASHBOARD_HTML = """
     <div class="apply-form">
       <span class="apply-status" id="apply-status-{{ r.job_id }}">{% if r.attempt_status_label %}{{ r.attempt_status_label }}{% else %}尚未加入清单{% endif %}</span>
       {% if r.display_status == 'ready_to_apply' and r.attempt_status not in ['submitted', 'selected', 'queued', 'browser_opened', 'filling', 'ready_to_submit'] %}
-      <form method="post" action="{{ url_for('queue_applypilot', job_id=r.job_id) }}" onsubmit="return addToApplicationList(event, this)">
+      <form method="post" action="{{ url_for('queue_applypilot', job_id=r.job_id) }}" data-applypilot onsubmit="return addToApplicationList(event, this)">
         <input type="hidden" name="action_token" value="{{ action_token }}">
         <button class="btn primary" type="submit">{{ r.apply_button_label }}</button>
       </form>
@@ -1203,7 +1274,7 @@ DASHBOARD_HTML = """
       <button type="button" class="modal-close" aria-label="关闭" onclick="closeStatusDialog()">×</button>
     </div>
     <p class="hint" id="status-dialog-hint">每次状态变化都会写入历史记录。</p>
-    <form class="status-form" id="status-form" method="post">
+    <form class="status-form" id="status-form" method="post" onsubmit="return saveStatus(event, this)">
       <input type="hidden" name="action_token" value="{{ action_token }}">
       <input type="hidden" name="return_to" value="dashboard">
       <label id="status-choice">新状态
@@ -1215,6 +1286,7 @@ DASHBOARD_HTML = """
         <input type="text" id="status-reason" name="reason" placeholder="例如：收到面试邀请">
       </label>
       <p class="same-status" id="same-status" hidden>请选择与当前状态不同的新状态。</p>
+      <p class="action-error" id="status-dialog-error" hidden></p>
       <div class="submission-fields full" id="submission-fields" hidden>
         <label>提交成功证据
           <input type="text" id="submission-evidence" name="submission_evidence"
@@ -1296,28 +1368,28 @@ function refreshFreshness(){
   });
   filterRows();
 }
-function openStatusDialog(button,mode){
+function openStatusDialog(button){
   statusTrigger=button;
   const modal=document.getElementById('status-modal');
   const form=document.getElementById('status-form');
   form.reset();
   form.action=button.dataset.action;
   modal.dataset.current=button.dataset.current;
-  modal.dataset.mode=mode;
+  modal.dataset.mode='change';
   document.getElementById('status-dialog-job').textContent=button.dataset.title;
   document.getElementById('submission-evidence').value=button.dataset.evidence||'';
   const select=document.getElementById('status-select');
-  select.value=mode==='confirm'?'submitted':button.dataset.current;
-  document.getElementById('status-choice').hidden=mode==='confirm';
-  document.getElementById('status-dialog-title').textContent=mode==='confirm'?'确认已提交':'转换申请状态';
-  document.getElementById('status-dialog-hint').textContent=mode==='confirm'
-    ?'仅在招聘平台已显示成功页、确认编号或确认信息后使用。'
-    :'可在待投递、已提交、被拒绝和面试中之间转换；变化会写入历史记录。';
-  document.getElementById('status-save').textContent=mode==='confirm'?'确认并记录':'保存新状态';
+  select.value=button.dataset.current;
+  document.getElementById('status-choice').hidden=false;
+  document.getElementById('status-dialog-title').textContent='转换申请状态';
+  document.getElementById('status-dialog-hint').textContent='可在待投递、已提交、被拒绝和面试中之间转换；变化会写入历史记录。';
+  document.getElementById('status-save').textContent='保存新状态';
+  document.getElementById('status-dialog-error').hidden=true;
+  document.getElementById('status-dialog-error').textContent='';
   updateStatusDialog();
   modal.hidden=false;
   document.body.classList.add('modal-open');
-  requestAnimationFrame(()=>{(mode==='confirm'?document.getElementById('submission-evidence'):select).focus();});
+  requestAnimationFrame(()=>select.focus());
 }
 function closeStatusDialog(){
   const modal=document.getElementById('status-modal');
@@ -1342,6 +1414,106 @@ function updateStatusDialog(){
   reason.required=returning;
   reason.placeholder=returning?'请说明为什么重新进入待投递':'例如：收到面试邀请';
   document.getElementById('status-save').disabled=same;
+}
+const statusStatIds={ready_to_apply:'stat-ready-to-apply',submitted:'stat-submitted',rejected:'stat-rejected',interview:'stat-interview'};
+function changeStat(status,delta){
+  const target=document.getElementById(statusStatIds[status]);
+  if(!target)return;
+  const current=parseInt(target.textContent||'0',10);
+  target.textContent=Math.max(0,current+delta);
+}
+function updateStatusStats(previous,next){
+  if(previous===next)return;
+  changeStat(previous,-1);
+  changeStat(next,1);
+}
+function clearCardActionError(card){
+  const error=card&&card.querySelector('[data-action-error]');
+  if(error){error.hidden=true;error.textContent='';}
+}
+function showCardActionError(card,message){
+  if(!card)return;
+  let error=card.querySelector('[data-action-error]');
+  if(!error){
+    error=document.createElement('span');
+    error.className='action-error';
+    error.dataset.actionError='1';
+    card.querySelector('.status-tools').appendChild(error);
+  }
+  error.textContent=message;
+  error.hidden=false;
+}
+function updateCardFromAction(data,source){
+  const card=source&&source.closest?source.closest('.row-item'):null;
+  if(!card)return;
+  const previous=card.dataset.status;
+  const next=data.display_status||previous;
+  updateStatusStats(previous,next);
+  card.dataset.status=next;
+  const statusChip=card.querySelector('[data-status-chip]');
+  if(statusChip&&data.status_label)statusChip.textContent=data.status_label;
+  const nextAction=card.querySelector('[data-next-action]');
+  if(nextAction){
+    nextAction.textContent=data.next_action?'下一步：'+data.next_action:'';
+    nextAction.hidden=!data.next_action;
+  }
+  const statusButton=card.querySelector('.status-action');
+  if(statusButton){
+    statusButton.dataset.current=next;
+    statusButton.dataset.evidence=data.submission_evidence||'';
+  }
+  const confirmForm=card.querySelector('[data-confirm-submitted]');
+  if(confirmForm)confirmForm.hidden=next!=='ready_to_apply';
+  const applyStatus=card.querySelector('.apply-status');
+  if(applyStatus&&data.attempt_status_label)applyStatus.textContent=data.attempt_status_label;
+  const applyForm=card.querySelector('form[data-applypilot]');
+  if(applyForm){
+    const blockedAttemptStatuses=['submitted','selected','queued','browser_opened','filling','ready_to_submit'];
+    applyForm.hidden=next!=='ready_to_apply'||blockedAttemptStatuses.includes(data.attempt_status||'');
+  }
+  clearCardActionError(card);
+  filterRows();
+}
+async function postDashboardAction(form){
+  const response=await fetch(form.action,{method:'POST',body:new FormData(form),headers:{'Accept':'application/json'}});
+  let data={};
+  try{data=await response.json();}catch(error){throw new Error('服务器返回了无法读取的结果');}
+  if(!response.ok||!data.ok)throw new Error(data.error||'状态更新失败');
+  return data;
+}
+async function confirmSubmitted(event,form){
+  event.preventDefault();
+  const button=form.querySelector('button');
+  const card=form.closest('.row-item');
+  clearCardActionError(card);
+  button.disabled=true;
+  try{
+    const data=await postDashboardAction(form);
+    updateCardFromAction(data,form);
+    form.hidden=true;
+  }catch(error){
+    showCardActionError(card,error.message);
+    button.disabled=false;
+  }
+  return false;
+}
+async function saveStatus(event,form){
+  event.preventDefault();
+  const button=document.getElementById('status-save');
+  const error=document.getElementById('status-dialog-error');
+  error.hidden=true;
+  error.textContent='';
+  button.disabled=true;
+  try{
+    const data=await postDashboardAction(form);
+    updateCardFromAction(data,statusTrigger);
+    closeStatusDialog();
+  }catch(actionError){
+    error.textContent=actionError.message;
+    error.hidden=false;
+    button.disabled=false;
+  }
+  return false;
 }
 async function addToApplicationList(event, form){
   event.preventDefault();
@@ -1635,12 +1807,16 @@ def dashboard_detail(job_id: str):
 
 @app.route("/dashboard/<job_id>/transition", methods=["POST"])
 def dashboard_transition(job_id: str):
+    wants_json = "application/json" in request.headers.get("Accept", "")
     supplied_token = request.form.get("action_token", "")
     if not supplied_token or not hmac.compare_digest(supplied_token, ACTION_TOKEN):
+        if wants_json:
+            return jsonify({"ok": False, "error": "状态请求已失效，请刷新 Dashboard 后重试。"}), 403
         return "状态请求已失效，请刷新 Dashboard 后重试。", 403
 
     cfg = load_config()
     board = _dashboard(cfg)
+    service = _attempts(cfg)
     return_to_dashboard = request.form.get("return_to") == "dashboard"
     try:
         row = board.get(job_id)
@@ -1675,36 +1851,71 @@ def dashboard_transition(job_id: str):
             next_action = default_next_actions.get(status)
 
         if status == "submitted":
-            submit_reason = reason or "用户确认外部平台已成功提交"
-            service = _attempts(cfg)
-            attempts = [
-                attempt for attempt in service.load_rows()
-                if attempt.get("job_id") == job_id
-                and attempt.get("status") not in {"cancelled", "failed"}
-            ]
-            latest_attempt = max(
-                attempts, key=lambda item: item.get("updated_at", ""), default=None,
+            submit_reason = reason or USER_CONFIRMED_SUBMISSION_REASON
+            _record_submitted(
+                board, service, job_id, reason=submit_reason,
+                submission_confirmed=submission_confirmed,
+                submission_evidence=evidence, next_action=next_action, notes=notes,
             )
-            if latest_attempt and latest_attempt.get("status") != "submitted":
-                service.advance(
-                    latest_attempt["attempt_id"], "submitted", actor="user",
-                    reason=submit_reason, submission_confirmed=submission_confirmed,
-                    submission_evidence=evidence, next_action=next_action, notes=notes,
-                )
-            else:
-                board.transition(
-                    job_id, status, actor="user", reason=submit_reason,
-                    next_action=next_action, notes=notes,
-                    submission_confirmed=submission_confirmed,
-                    submission_evidence=evidence,
-                )
         else:
             board.transition(
                 job_id, status, actor="user", reason=reason,
                 next_action=next_action, notes=notes,
             )
     except (KeyError, ValueError) as exc:
+        if wants_json:
+            return jsonify({"ok": False, "error": str(exc)}), 400
         return redirect(url_for("dashboard_view", error=str(exc)))
+    if wants_json:
+        return jsonify(_dashboard_action_payload(
+            board, service, job_id, message="状态已更新",
+        ))
+    if return_to_dashboard:
+        return redirect(url_for("dashboard_view", saved="1"))
+    return redirect(url_for("dashboard_detail", job_id=job_id))
+
+
+@app.route("/dashboard/<job_id>/confirm-submitted", methods=["POST"])
+def confirm_submitted(job_id: str):
+    wants_json = "application/json" in request.headers.get("Accept", "")
+    supplied_token = request.form.get("action_token", "")
+    if not supplied_token or not hmac.compare_digest(supplied_token, ACTION_TOKEN):
+        if wants_json:
+            return jsonify({"ok": False, "error": "状态请求已失效，请刷新 Dashboard 后重试。"}), 403
+        return "状态请求已失效，请刷新 Dashboard 后重试。", 403
+
+    cfg = load_config()
+    board = _dashboard(cfg)
+    return_to_dashboard = request.form.get("return_to") == "dashboard"
+    try:
+        row = board.get(job_id)
+        if row is None:
+            raise KeyError(f"Dashboard 中找不到岗位: {job_id}")
+        if _user_status(row.get("status", "")) != "ready_to_apply":
+            raise ValueError("当前岗位已不是待投递状态，无法重复确认提交")
+
+        service = _attempts(cfg)
+        latest_attempt = _latest_active_attempt(service, job_id)
+        evidence = (
+            (latest_attempt or {}).get("submission_evidence", "").strip()
+            or row.get("submission_evidence", "").strip()
+            or USER_CONFIRMED_SUBMISSION_EVIDENCE
+        )
+        _record_submitted(
+            board, service, job_id,
+            reason=USER_CONFIRMED_SUBMISSION_REASON,
+            submission_confirmed=True,
+            submission_evidence=evidence,
+            next_action="等待雇主回复并按计划跟进",
+        )
+    except (KeyError, ValueError) as exc:
+        if wants_json:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        return redirect(url_for("dashboard_view", error=str(exc)))
+    if wants_json:
+        return jsonify(_dashboard_action_payload(
+            board, service, job_id, message="已确认外部平台提交成功",
+        ))
     if return_to_dashboard:
         return redirect(url_for("dashboard_view", saved="1"))
     return redirect(url_for("dashboard_detail", job_id=job_id))

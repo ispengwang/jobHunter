@@ -21,10 +21,11 @@ JobHunter 负责搜索、去重、确定性硬过滤、DeepSeek API 打分、简
 或候选人资料。Web App 或 Agent
 重启不会把内部选择当作提交；用户可在同一张卡片继续已有 attempt。
 
-如果用户已经在外部平台完成提交，可在同一张 Dashboard 卡片展开“确认已提交”，填写
-成功页文字、确认编号或确认 URL，并再次明确勾选确认。系统会同步 Dashboard 主记录、
-已有 ApplyPilot attempt、`submitted_at` 和事件历史。卡片也保留“转换申请状态”，用于
-在待投递、已提交、被拒绝和面试中之间更新；从终态改回待投递必须填写原因。
+如果用户已经在外部平台完成提交并确认成功，只需在同一张 Dashboard 卡片点击一次
+“确认已提交”，不需要再填写成功页文字、确认编号、确认 URL 或额外勾选。系统会自动记录
+用户确认标记，并同步 Dashboard 主记录、已有 ApplyPilot attempt、`submitted_at` 和事件历史。
+确认提交和“转换申请状态”都会只更新对应卡片及统计，不会刷新整个 Dashboard；从终态改回
+待投递必须填写原因。
 
 ## 启动完整流程
 
@@ -112,5 +113,6 @@ venv/bin/python run.py \
   --submission-evidence "<成功页文本或确认 URL>"
 ```
 
-没有明确成功证据时不得记录 `submitted`。Agent 选择、打开网页、自动填写、上传简历或
-点击 Submit 本身都不是提交证据。
+没有明确成功证据时，Agent 不得记录 `submitted`。Agent 选择、打开网页、自动填写、上传
+简历或点击外部平台的 Submit 本身都不是提交证据；Dashboard 的一键确认只适用于用户已经
+亲自确认外部平台成功的情况。

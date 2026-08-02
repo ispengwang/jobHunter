@@ -202,11 +202,11 @@ new → review → ready_to_apply → applying → submitted → follow_up
 | `review` | 待审核 | 已发现，尚未决定是否准备申请 |
 | `ready_to_apply` | 待投递 | 通过筛选，材料已准备并经人工检查 |
 | `needs_user` | 需要你处理 | 缺资料、验证、未知问题或其他必须由用户完成的动作 |
-| `submitted` | 已提交 | 平台显示明确成功证据 |
+| `submitted` | 已提交 | ApplyPilot 有明确成功证据，或用户在已确认外部平台成功后通过 Dashboard 一键确认 |
 | `skipped` | 已跳过 | 明确决定不投，必须填写原因 |
 | `blocked` | 卡住 | 链接失效、资格不明、需要补充信息或平台环节无法继续 |
 
-`submitted` 不能由 Agent 选择、生成材料、打开链接、自动填表、上传简历或仅点击 Submit 触发，只能在平台出现明确成功证据后写入。`skipped`、`blocked` 和 `needs_user` 必须有原因，不能用模糊的“AI decided”代替。
+`submitted` 不能由 Agent 选择、生成材料、打开链接、自动填表、上传简历或仅点击外部平台的 Submit 触发。用户已经在外部平台确认成功后，可以在 Dashboard 点击一次“确认已提交”；该动作记录用户确认标记，不再要求输入额外证据文字或 URL。`skipped`、`blocked` 和 `needs_user` 必须有原因，不能用模糊的“AI decided”代替。
 
 ### 5.4 仪表盘写入协议
 
@@ -217,7 +217,7 @@ new → review → ready_to_apply → applying → submitted → follow_up
 3. 对新增岗位写入 `review`，记录 `discovered_at` 和运行批次。
 4. 写入筛选结论、匹配分、签证信号和跳过/卡住原因。
 5. 只有材料通过人工检查后才改为 `ready_to_apply`。
-6. 平台出现明确成功证据后，再记录 `submitted_at`、`submission_evidence` 和 `submitted`。
+6. 平台出现明确成功证据后，或用户在 Dashboard 一键确认外部提交成功后，再记录 `submitted_at`、`submission_evidence` 和 `submitted`。
 7. 每次状态变化同时追加一条 `application-events.csv` 事件。
 
 事件日志建议字段：`event_id, job_id, run_id, timestamp, actor, from_status, to_status, action, reason, artifact_path`。`actor` 使用 `codex`、`user` 或 `system`，这样可以清楚区分 AI 做了什么和用户亲自做了什么。
