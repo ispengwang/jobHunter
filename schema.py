@@ -137,6 +137,17 @@ def norm_location(loc: Optional[str]) -> str:
     return _WS.sub(" ", s).strip()
 
 
+def job_identity_key(company: Optional[str], title: Optional[str]) -> str:
+    """Return the source-independent identity used to group one advertised role.
+
+    The key deliberately excludes source and location.  A single employer can
+    publish the same role on several boards with different location formatting;
+    the current search scope is one metro area, so those records should share
+    one application identity.
+    """
+    return f"{norm_company(company)}|{norm_title(title)}"
+
+
 def _job_id_from_key(key: str) -> str:
     return hashlib.md5(key.encode("utf-8")).hexdigest()[:12]
 
@@ -159,8 +170,7 @@ def canonical_job_id(
     against WF-101; it is deliberately ignored.
     """
     del location
-    key = f"{norm_company(company)}|{norm_title(title)}"
-    return _job_id_from_key(key)
+    return _job_id_from_key(job_identity_key(company, title))
 
 
 def legacy_job_id(company: Optional[str], title: Optional[str], url: Optional[str]) -> str:

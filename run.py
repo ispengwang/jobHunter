@@ -166,8 +166,19 @@ def jobs_to_score(
 ) -> list[Job]:
     """Return only unseen jobs unless a rules-change run explicitly requests a full rescore."""
     if rescore_all:
-        return list(jobs)
-    return [job for job in jobs if job.id not in existing_job_ids]
+        candidates = list(jobs)
+    else:
+        candidates = [job for job in jobs if job.id not in existing_job_ids]
+    # Keep the scoring/selection contract one-row-per-canonical-job even when
+    # an older cache was created before the latest dedupe pass.
+    seen: set[str] = set()
+    unique: list[Job] = []
+    for job in candidates:
+        if job.id in seen:
+            continue
+        seen.add(job.id)
+        unique.append(job)
+    return unique
 
 
 def load_jobs(path: Path) -> list[Job]:
@@ -469,7 +480,9 @@ def main() -> None:
             log.error("没有缓存 %s,先跑一次完整抓取", cache_path)
             sys.exit(1)
         jobs = load_jobs(cache_path)
-        log.info("从缓存读取 %d 条", len(jobs))
+        before_dedupe = len(jobs)
+        jobs = dedupe(jobs, cfg["dedupe"]["fuzzy_threshold"])
+        log.info("从缓存读取 %d 条，去重后 %d 条", before_dedupe, len(jobs))
     else:
         jobs = scrape(cfg)
         if not jobs:

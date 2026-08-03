@@ -170,7 +170,8 @@ output/
 | `resume_id` | 选中的简历版本 |
 | `resume_reason` | 选择该版本的简短解释 |
 | `status` | 见下方状态机 |
-| `skip_reason` | 跳过时必填 |
+| `skip_reason` | 用户主动跳过时必填 |
+| `unavailable_reason` | 招聘方不可用时的分类：`expired` / `no_longer_hiring` / `link_unavailable` / `filled` / `other` |
 | `blocked_reason` | 卡住时必填 |
 | `needs_user_reason` | 需要用户处理时必填 |
 | `submitted_at` | 实际提交时间；未提交为空 |
@@ -187,11 +188,11 @@ output/
 ```text
 new → review → ready_to_apply → applying → submitted → follow_up
        │             │             │           │
-       ├→ skipped    └→ needs_user └→ blocked  └→ rejected / interview / withdrawn
+       ├→ skipped    ├→ unavailable  └→ needs_user / blocked  └→ rejected / interview / offer / withdrawn
 ```
 
-主 Dashboard 将这些详细执行状态投影成四个用户状态：`ready_to_apply`（待投递）、
-`submitted`（已提交）、`rejected`（被拒绝）、`interview`（面试中）。内部的
+主 Dashboard 将这些详细执行状态投影成用户状态：`ready_to_apply`（待投递）、
+`submitted`（已提交）、`offer`（有 Offer）、`rejected`（被拒绝）、`interview`（面试中）。内部的
 `review`、`applying`、`needs_user`、`blocked` 等状态和原因继续保留用于审计，
 不会因为界面精简而删除。
 
@@ -203,7 +204,9 @@ new → review → ready_to_apply → applying → submitted → follow_up
 | `ready_to_apply` | 待投递 | 通过筛选，材料已准备并经人工检查 |
 | `needs_user` | 需要你处理 | 缺资料、验证、未知问题或其他必须由用户完成的动作 |
 | `submitted` | 已提交 | ApplyPilot 有明确成功证据，或用户在已确认外部平台成功后通过 Dashboard 一键确认 |
+| `offer` | 有 Offer | 用户确认收到 Offer 后手动记录；事件日志保留变更时间和备注 |
 | `skipped` | 已跳过 | 明确决定不投，必须填写原因 |
+| `unavailable` | 岗位已失效 | 招聘方已过期、停止招聘、链接失效或已招满；必须选择失效原因，不计入用户“已忽略” |
 | `blocked` | 卡住 | 链接失效、资格不明、需要补充信息或平台环节无法继续 |
 
 `submitted` 不能由 Agent 选择、生成材料、打开链接、自动填表、上传简历或仅点击外部平台的 Submit 触发。用户已经在外部平台确认成功后，可以在 Dashboard 点击一次“确认已提交”；该动作记录用户确认标记，不再要求输入额外证据文字或 URL。`skipped`、`blocked` 和 `needs_user` 必须有原因，不能用模糊的“AI decided”代替。
@@ -214,11 +217,11 @@ new → review → ready_to_apply → applying → submitted → follow_up
 
 1. 读取现有仪表盘，不覆盖历史记录。
 2. 用 canonical key 合并新岗位。
-3. 对新增岗位写入 `review`，记录 `discovered_at` 和运行批次。
+3. 对新增岗位写入 `review`，记录 `discovered_at` 和运行批次；同一公司/职位跨来源只保留一个 canonical job ID，并把其他链接写入 `duplicate_urls`。
 4. 写入筛选结论、匹配分、签证信号和跳过/卡住原因。
 5. 只有材料通过人工检查后才改为 `ready_to_apply`。
 6. 平台出现明确成功证据后，或用户在 Dashboard 一键确认外部提交成功后，再记录 `submitted_at`、`submission_evidence` 和 `submitted`。
-7. 每次状态变化同时追加一条 `application-events.csv` 事件。
+7. 每次状态变化同时追加一条 `application-events.csv` 事件；`unavailable` 额外记录失效分类，且不会进入下一轮 Agent 选择。
 
 事件日志建议字段：`event_id, job_id, run_id, timestamp, actor, from_status, to_status, action, reason, artifact_path`。`actor` 使用 `codex`、`user` 或 `system`，这样可以清楚区分 AI 做了什么和用户亲自做了什么。
 

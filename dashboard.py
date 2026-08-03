@@ -13,9 +13,16 @@ from schema import Job
 
 STATUSES = {
     "new", "review", "ready_to_apply", "applying", "needs_user", "submitted",
-    "follow_up", "skipped", "blocked", "interview", "rejected", "withdrawn",
+    "follow_up", "skipped", "unavailable", "blocked", "interview", "offer", "rejected", "withdrawn",
 }
-REASON_REQUIRED = {"skipped", "blocked", "needs_user"}
+REASON_REQUIRED = {"skipped", "unavailable", "blocked", "needs_user"}
+AVAILABILITY_REASON_LABELS = {
+    "expired": "已过期",
+    "no_longer_hiring": "已停止招聘",
+    "link_unavailable": "岗位链接失效",
+    "filled": "职位已招满",
+    "other": "其他岗位不可用原因",
+}
 
 DASHBOARD_FIELDS = [
     "job_id", "company", "title", "source", "url", "duplicate_urls", "location",
@@ -23,7 +30,7 @@ DASHBOARD_FIELDS = [
     "job_summary", "matched", "missing", "eligibility_reason", "match_score",
     "resume_id", "resume_path", "resume_fit_score", "resume_reason", "application_mode",
     "freshness_bucket", "sponsorship_signal", "status", "skip_reason",
-    "blocked_reason", "needs_user_reason", "submitted_at", "submission_evidence",
+    "unavailable_reason", "blocked_reason", "needs_user_reason", "submitted_at", "submission_evidence",
     "next_action", "last_action", "last_updated_at", "notes", "artifact_path",
     "last_run_id", "last_synced_at",
 ]
@@ -209,7 +216,7 @@ class Dashboard:
         if new_row:
             base.update({
                 "discovered_at": now, "first_seen_at": now, "status": "review", "skip_reason": "", "blocked_reason": "",
-                "needs_user_reason": "", "submitted_at": "", "submission_evidence": "",
+                "unavailable_reason": "", "needs_user_reason": "", "submitted_at": "", "submission_evidence": "",
                 "next_action": "Review recommendation", "last_action": "discovered", "notes": "",
                 "artifact_path": artifact_path,
             })
@@ -232,6 +239,7 @@ class Dashboard:
         reason: str = "",
         next_action: str | None = None,
         notes: str | None = None,
+        unavailable_reason: str = "",
         submission_confirmed: bool = False,
         submission_evidence: str = "",
         run_id: str = "",
@@ -239,6 +247,12 @@ class Dashboard:
     ) -> dict[str, str]:
         if status not in STATUSES:
             raise ValueError(f"未知 Dashboard 状态: {status}")
+        unavailable_reason = unavailable_reason.strip()
+        if status == "unavailable":
+            if unavailable_reason not in AVAILABILITY_REASON_LABELS:
+                raise ValueError("岗位已失效必须选择具体原因")
+            if not reason.strip():
+                reason = AVAILABILITY_REASON_LABELS[unavailable_reason]
         if status in REASON_REQUIRED and not reason.strip():
             raise ValueError(f"状态 {status} 必须填写原因")
         if status == "submitted" and (not submission_confirmed or not submission_evidence.strip()):
@@ -254,6 +268,10 @@ class Dashboard:
         target["last_updated_at"] = utc_now()
         if status == "skipped":
             target["skip_reason"] = reason.strip()
+        if status == "unavailable":
+            target["unavailable_reason"] = unavailable_reason
+        elif status != "unavailable":
+            target["unavailable_reason"] = ""
         if status == "blocked":
             target["blocked_reason"] = reason.strip()
         if status == "needs_user":
@@ -269,8 +287,11 @@ class Dashboard:
             target["artifact_path"] = artifact_path
         self._write_rows(rows)
         self._append_event(
-            job_id=job_id, actor=actor, action="status_changed", from_status=from_status,
-            to_status=status, reason=reason, run_id=run_id, artifact_path=artifact_path,
+            job_id=job_id, actor=actor,
+            action="availability_marked" if status == "unavailable" else "status_changed",
+            from_status=from_status, to_status=status, reason=reason,
+            run_id=run_id, artifact_path=artifact_path,
+            details=unavailable_reason if status == "unavailable" else "",
         )
         return target
 

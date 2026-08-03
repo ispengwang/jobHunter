@@ -15,6 +15,7 @@ from application_attempts import (
     configured_platform_limits,
     platform_limit_key,
     platform_submission_mode,
+    submitted_today_job_ids,
     submitted_today_by_platform,
 )
 from candidate_profile import UNKNOWN, load_or_initialise, save_profile
@@ -385,9 +386,76 @@ try:
          "source": "linkedin", "url": "https://boards.greenhouse.io/acme/3"},
     ], "Australia/Melbourne")
     check("已提交按平台分别计数", platform_counts, {"linkedin": 1, "indeed": 1, "external_ats": 1})
+    check("今日提交视图按岗位 ID 统计", submitted_today_job_ids([
+        {"job_id": "today-job", "status": "submitted", "submission_evidence": "ok",
+         "submitted_at": today_submission},
+        {"job_id": "today-offer-job", "status": "offer", "submission_evidence": "ok",
+         "submitted_at": today_submission},
+        {"job_id": "not-submitted", "status": "ready_to_apply", "submission_evidence": "",
+         "submitted_at": today_submission},
+    ], "Australia/Melbourne"), {"today-job", "today-offer-job"})
     check("Agent 选择后岗位进入待投递", dashboard.get(job.id)["status"], "ready_to_apply")
     duplicate = attempts.create(job.id, reloaded, profile_path)
     check("同一岗位不会重复创建活动交接", duplicate["attempt_id"], attempt["attempt_id"])
+
+    duplicate_root = root / "duplicate-selection-check"
+    duplicate_board = Dashboard(
+        duplicate_root / "application-dashboard.csv",
+        duplicate_root / "application-events.csv",
+    )
+    duplicate_attempts = ApplicationAttempts(
+        duplicate_root / "application-attempts.csv", duplicate_board,
+        skill_path=skill_path, project_root=root,
+    )
+    legacy_duplicate_a = Job(
+        "seek", "Junior Platform Engineer", "SameRoleCo",
+        "https://www.seek.com.au/job/legacy-a", id="legacy-platform-a",
+    )
+    legacy_duplicate_b = Job(
+        "linkedin", "Junior Platform Engineer", "SameRoleCo Pty Ltd",
+        "https://www.linkedin.com/jobs/view/legacy-b", id="legacy-platform-b",
+    )
+    for duplicate_job, duplicate_score in [
+        (legacy_duplicate_a, 74), (legacy_duplicate_b, 86),
+    ]:
+        duplicate_board.upsert_recommendation(
+            duplicate_job, job_fit_score=duplicate_score, job_fit_reason="重复选择测试",
+            job_summary="同一公司同一岗位的历史重复记录", sponsorship_signal="unknown",
+            resume_id=selection.resume_id, resume_fit_score=selection.fit_score,
+            resume_reason=selection.reason, application_mode="targeted",
+            freshness_bucket="within_24h", resume_path=str(selection.path),
+        )
+    duplicate_selection = duplicate_attempts.select_eligible(
+        reloaded, profile_path, max_new=5,
+    )
+    check("历史不同 job_id 的同一岗位只选一次", len(duplicate_selection["selected"]), 1)
+    check(
+        "重复岗位选择较高分的代表记录",
+        duplicate_selection["selected"][0]["job_id"],
+        legacy_duplicate_b.id,
+    )
+
+    unavailable_job = Job(
+        "seek", "Junior Closed Role", "ClosedCo", "https://example.test/jobs/closed",
+        posted_date=job.posted_date, description="Role used to test source availability.",
+    )
+    dashboard.upsert_recommendation(
+        unavailable_job, job_fit_score=76, job_fit_reason="可用性状态测试",
+        job_summary="用于验证岗位已失效分类", sponsorship_signal="unknown",
+        resume_id=selection.resume_id, resume_fit_score=selection.fit_score,
+        resume_reason=selection.reason, application_mode="targeted",
+        freshness_bucket="within_24h", resume_path=str(selection.path),
+    )
+    closed_row = dashboard.transition(
+        unavailable_job.id, "unavailable", actor="user", unavailable_reason="expired",
+    )
+    check("岗位已失效使用独立状态", closed_row["status"], "unavailable")
+    check("岗位已失效保存具体原因", closed_row["unavailable_reason"], "expired")
+    check("岗位已失效不进入今日队列", unavailable_job.id not in {
+        row["job_id"] for row in dashboard.daily_queues()["today"]
+    })
+    check("岗位已失效事件单独标记", dashboard.events_for(unavailable_job.id)[-1]["action"], "availability_marked")
+    check("岗位已失效事件保存原因类别", dashboard.events_for(unavailable_job.id)[-1]["details"], "expired")
 
     second_seek = Job(
         "seek", "Graduate AI Engineer", "Beta", "https://example.test/jobs/3",
@@ -574,6 +642,31 @@ try:
             resume_reason=selection.reason, application_mode="manual_review",
             freshness_bucket="within_24h", resume_path=str(selection.path), run_id="dismiss-run",
         )
+        route_unavailable_job = Job(
+            "linkedin", "Junior Recruiting Closed", "RouteClosedCo",
+            "https://example.test/jobs/route-closed", posted_date=job.posted_date,
+            description="Role used to test the unavailable status route.",
+        )
+        dashboard.upsert_recommendation(
+            route_unavailable_job, job_fit_score=72, job_fit_reason="路线状态测试",
+            job_summary="用于验证网页状态路由", sponsorship_signal="unknown",
+            resume_id=selection.resume_id, resume_fit_score=selection.fit_score,
+            resume_reason=selection.reason, application_mode="manual_review",
+            freshness_bucket="within_24h", resume_path=str(selection.path), run_id="dismiss-run",
+        )
+        route_closed = client.post(
+            f"/dashboard/{route_unavailable_job.id}/transition",
+            data={
+                "action_token": webapp.ACTION_TOKEN,
+                "status": "unavailable",
+                "unavailable_reason": "no_longer_hiring",
+            },
+            headers={"Accept": "application/json"},
+        )
+        route_closed_payload = route_closed.get_json()
+        check("网页可把岗位标记为招聘方不可用", route_closed.status_code, 200)
+        check("网页状态路由保存不可用分类", route_closed_payload["unavailable_reason"], "no_longer_hiring")
+        check("网页状态路由不把它当成用户忽略", route_closed_payload["dismissed"], False)
         check(
             "Dashboard 可解析评分维度权重",
             webapp._extract_score_dimensions("| Role fit | 0–30 |"),
@@ -586,10 +679,27 @@ try:
         check("Dashboard 页面可打开", client.get("/dashboard").status_code, 200)
         dashboard_html = client.get("/dashboard").get_data(as_text=True)
         check("Dashboard 显示不想要按钮", "不想要" in dashboard_html)
+        check("Dashboard 提供独立的岗位已失效入口", "岗位已失效" in dashboard_html)
+        check("默认工作机会列表隐藏岗位已失效记录", unavailable_job.title in dashboard_html, False)
+        unavailable_html = client.get("/dashboard?view=unavailable").get_data(as_text=True)
+        check("Dashboard 有独立的已失效视图", unavailable_job.title in unavailable_html)
+        check("已失效视图显示具体原因", "已过期" in unavailable_html)
+        unavailable_detail = client.get(f"/dashboard/{unavailable_job.id}")
+        check("岗位详情显示不可用原因", "已过期" in unavailable_detail.get_data(as_text=True))
+        restored_unavailable = client.post(
+            f"/dashboard/{unavailable_job.id}/restore-unavailable",
+            data={"action_token": webapp.ACTION_TOKEN},
+            headers={"Accept": "application/json"},
+        )
+        check("已失效岗位可以单独恢复", restored_unavailable.status_code, 200)
+        check("恢复已失效岗位写回 review", dashboard.get(unavailable_job.id)["status"], "review")
         check("Dashboard 不想要按钮使用受保护路由", f"/dashboard/{dismiss_job.id}/not-interested" in dashboard_html)
         check("Dashboard 显示恢复入口", f"/dashboard/{restore_job.id}/not-interested" in dashboard_html)
         check("Dashboard 显示最近同步入口", "最近同步" in dashboard_html)
         check("Dashboard 提供最近同步筛选", 'data-v="latest"' in dashboard_html)
+        check("Dashboard 提供今日提交视图", 'data-v="submitted_today"' in dashboard_html)
+        check("Dashboard 显示今日提交统计", 'id="stat-today-submitted"' in dashboard_html)
+        check("Dashboard 今日行动明确为待处理", "今日行动（待处理）" in dashboard_html)
         check("Dashboard 页面禁止缓存", client.get("/dashboard").headers.get("Cache-Control"), "no-store, max-age=0")
         sync_status = client.get("/dashboard/status")
         check("Dashboard 同步状态接口可读取", sync_status.status_code, 200)
@@ -622,18 +732,23 @@ try:
         check("Dashboard 使用渐进加载避免首屏过长", 'id="load-more"' in dashboard_html)
         check("Dashboard 显示 JD 摘要", "更新后的 JD 摘要" in dashboard_html)
         check("Dashboard 显示具体发布日期", "发布于 2026-07-24 14:00 AEST" in dashboard_html)
-        check("Dashboard 状态筛选只保留四类", all(
+        check("Dashboard 状态筛选包含用户状态", all(
             token in dashboard_html for token in [
                 'data-v="ready_to_apply"', 'data-v="submitted"',
-                'data-v="rejected"', 'data-v="interview"',
+                'data-v="rejected"', 'data-v="interview"', 'data-v="offer"',
             ]
         ))
+        check("Dashboard 默认状态筛选为待投递", "status: 'ready_to_apply'" in dashboard_html)
+        check("Dashboard 重置筛选回到待投递", "state.status='ready_to_apply'" in dashboard_html)
         check("Dashboard 不再显示内部状态筛选", all(
             token not in dashboard_html for token in [
                 'data-v="review"', 'data-v="applying"',
                 'data-v="needs_user"', 'data-v="blocked"',
             ]
         ))
+        check("Dashboard 不再显示无用模式筛选", "模式" in dashboard_html, False)
+        check("Dashboard 不再显示精准投递模式", "精准投递" in dashboard_html, False)
+        check("Dashboard 不再显示人工复核模式", "人工复核" in dashboard_html, False)
         check("旧 ApplyPilot 页面重定向 Dashboard", client.get("/applypilot").status_code, 302)
         check("旧投递地址重定向 Dashboard", client.get("/attempts").status_code, 302)
         check("ApplyPilot 交接 JSON 可读取", client.get(
@@ -797,6 +912,20 @@ try:
             converted_row["submission_evidence"],
             webapp.USER_CONFIRMED_SUBMISSION_EVIDENCE,
         )
+        offer_status = client.post(
+            f"/dashboard/{linked_in.id}/transition",
+            data={
+                "action_token": webapp.ACTION_TOKEN,
+                "return_to": "dashboard",
+                "status": "offer",
+                "reason": "收到正式 Offer",
+            },
+            headers={"Accept": "application/json"},
+        )
+        offer_payload = offer_status.get_json()
+        check("用户可把岗位标记为有 Offer", offer_status.status_code, 200)
+        check("有 Offer 返回新增展示状态", offer_payload["display_status"], "offer")
+        check("有 Offer 写入主状态", webapp._dashboard(webapp.load_config()).get(linked_in.id)["status"], "offer")
 
         automatic_start = client.post(
             f"/dashboard/{second_seek.id}/applypilot",

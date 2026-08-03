@@ -45,7 +45,7 @@ The system remains local-first. It does not bypass platform security controls, i
 
 - Add Candidate Profile import, display, edit and validation routes.
 - Add Dashboard filters, daily action queues, job detail, status updates and event history.
-- Add clear actions for `review`, `ready_to_apply`, `submitted`, `skipped` and `blocked`; require a reason where the policy requires one.
+- Add clear actions for `review`, `ready_to_apply`, `submitted`, `skipped`, `unavailable` and `blocked`; require a reason where the policy requires one.
 
 ### 4. ApplyPilot integration — autonomous Agent execution and outcomes
 
@@ -70,7 +70,7 @@ The system remains local-first. It does not bypass platform security controls, i
 | Candidate Profile | A profile can be initialised from `profile/resume.md`, edited, persisted and reloaded without silently replacing user edits. Missing required values are reported as `unknown`/validation items. | Profile unit tests and web-route test. |
 | Resume variants | A manifest supports the default resume plus additional paths. Selection returns `resume_id`, fit score and reason without adding unsupported claims. | Resume catalogue tests. |
 | Dashboard memory | Reprocessing the same job updates one canonical row, preserves user status/notes, and creates an event for meaningful state changes. | Dashboard idempotency and event-log tests. |
-| Dashboard state safety | `skipped`/`blocked` require a reason; `submitted` requires an explicit recorded submission outcome and timestamp. | State-transition tests. |
+| Dashboard state safety | `skipped`/`blocked` require a reason; `unavailable` requires a typed availability reason; `submitted` requires an explicit recorded submission outcome and timestamp. | State-transition tests. |
 | Screening policy | Entry/junior jobs are eligible by default; senior roles are review/skip candidates; freshness priority is ordered `<24h`, `<=3d`, older/unknown. | Policy tests using fixed dates. |
 | Broad vs targeted | Every eligible job has separate job-fit and resume-fit values, an explicit mode and a reason. Thresholds are configurable. | Pipeline test with fixture jobs. |
 | Generated materials | Material uses the selected resume source, stable job-ID output path and summary metadata. | Generation test. |

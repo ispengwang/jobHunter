@@ -93,7 +93,7 @@ python run.py --from-cache --limit 20
 python run.py --from-cache
 ```
 
-给全部岗位打分，输出 `output/jobs-ranked.md`（单文档汇总，推荐先看）和 `output/jobs-ranked.csv`，并同步 `data/application-dashboard.csv`。系统会同时记录岗位匹配分、简历匹配分、`broad` / `targeted` 路径、发布时间优先级和当前申请状态。打开 Dashboard 时新鲜度按当前时间计算；运行完成后已打开页面会自动刷新，并可用“最近同步”查看本轮写入的岗位。默认不批量生成材料；需要时再做下一步。
+给全部岗位打分，输出 `output/jobs-ranked.md`（单文档汇总，推荐先看）和 `output/jobs-ranked.csv`，并同步 `data/application-dashboard.csv`。系统会记录岗位匹配分、简历匹配分、内部决策元数据、发布时间优先级和当前申请状态。打开 Dashboard 时新鲜度按当前时间计算；运行完成后已打开页面会自动刷新。“最近同步”查看最新一次运行写入的岗位，“今日行动（待处理）”查看仍需处理的岗位，“今日提交”查看今天按本地日期确认提交的岗位。默认不批量生成材料；需要时再做下一步。
 
 ### 第四步（可选）：对看中的岗位生成申请材料
 

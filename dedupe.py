@@ -5,7 +5,7 @@
 
 策略:
   1. URL 精确匹配
-  2. norm(company) + norm(title) + norm(location) 精确匹配
+  2. norm(company) + norm(title) 精确匹配（地点只作为补全信息）
   3. 同公司内 title 模糊匹配 (rapidfuzz)
 保留信息最全的那条,但把所有来源 URL 都合并进 duplicate_urls ——
 一个岗位在几个平台同时挂,这本身是个信号。
@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 
-from schema import Job, norm_company, norm_title, norm_location
+from schema import Job, norm_company, norm_title
 
 log = logging.getLogger(__name__)
 
@@ -71,7 +71,14 @@ def dedupe(jobs: list[Job], fuzzy_threshold: int = 88) -> list[Job]:
             by_url[j.url] = j
     stage1 = list(by_url.values())
 
-    # ---- 二级:company + title + location 精确
+    # ---- 二级:company + title 精确
+    #
+    # canonical_job_id intentionally ignores location.  Keeping location in
+    # this exact-match key meant that the same role could survive this stage
+    # when SEEK said "Melbourne VIC" and another source said "Melbourne,
+    # Victoria, Australia"; if rapidfuzz was unavailable it then reached the
+    # scorer twice.  Location is descriptive metadata, not an application
+    # identity in the current single-metro search.
     by_key: dict[tuple, Job] = {}
     stage2: list[Job] = []
     for j in stage1:
@@ -82,7 +89,7 @@ def dedupe(jobs: list[Job], fuzzy_threshold: int = 88) -> list[Job]:
         if not company or company == "unknown":
             stage2.append(j)
             continue
-        key = (company, norm_title(j.title), norm_location(j.location))
+        key = (company, norm_title(j.title))
         if key in by_key:
             by_key[key] = _merge(*_ordered(by_key[key], j))
         else:

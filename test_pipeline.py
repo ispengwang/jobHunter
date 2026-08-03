@@ -97,6 +97,14 @@ jobs = [
 result = dedupe(jobs, fuzzy_threshold=88)
 check("去重后数量", len(result), 3)
 
+different_location_format = [
+    mk("seek", "Software Engineer", "LocationCo", "https://seek.example/location-1", loc="Melbourne VIC"),
+    mk("indeed", "Software Engineer", "LocationCo Pty Ltd", "https://indeed.example/location-2", loc="Melbourne, Victoria, Australia"),
+]
+location_result = dedupe(different_location_format, fuzzy_threshold=88)
+check("不同平台地点写法不会拆成两个岗位", len(location_result), 1)
+check("地点差异仍保留其他来源链接", len(location_result[0].duplicate_urls), 1)
+
 with tempfile.TemporaryDirectory() as temp_dir:
     cache_path = Path(temp_dir) / "jobs-raw.csv"
     save_jobs(result, cache_path)

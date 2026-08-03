@@ -40,12 +40,13 @@ from ruamel.yaml import YAML
 from candidate_profile import (
     load_or_initialise, profile_form_sections, save_profile, update_from_form,
 )
-from dashboard import Dashboard, STATUSES
+from dashboard import Dashboard, STATUSES, AVAILABILITY_REASON_LABELS
 from application_attempts import (
     ApplicationAttempts,
     configured_platform_limits,
     platform_submission_mode,
     platform_limit_key,
+    submitted_today_job_ids,
     submitted_today_by_platform,
 )
 from application_policy import freshness_bucket
@@ -127,20 +128,22 @@ STATUS_LABELS = {
     "new": "新发现", "review": "待审核", "ready_to_apply": "待投递",
     "applying": "投递中", "needs_user": "需要你处理", "submitted": "已提交",
     "follow_up": "待跟进",
-    "skipped": "已跳过", "blocked": "已卡住", "interview": "面试中",
+    "skipped": "已跳过", "unavailable": "岗位已失效", "blocked": "已卡住", "interview": "面试中",
+    "offer": "有 Offer",
     "rejected": "已拒绝", "withdrawn": "已撤回",
 }
-USER_STATUSES = ("ready_to_apply", "submitted", "rejected", "interview")
+USER_STATUSES = ("ready_to_apply", "submitted", "rejected", "interview", "offer", "unavailable")
 USER_STATUS_LABELS = {
     "ready_to_apply": "待投递",
     "submitted": "已提交",
     "rejected": "被拒绝",
     "interview": "面试中",
+    "offer": "有 Offer",
+    "unavailable": "岗位已失效",
 }
 DISMISSED_STATUS_LABEL = "已忽略"
 NOT_INTERESTED_REASON = "用户标记为不感兴趣"
 RESTORE_DISMISSED_REASON = "用户将岗位恢复到待审核列表"
-MODE_LABELS = {"targeted": "精准投递", "broad": "海投", "manual_review": "人工复核"}
 FRESHNESS_LABELS = {
     "within_24h": "24 小时内", "within_3d": "3 天内", "older": "较早发布", "unknown": "发布时间未知",
 }
@@ -161,7 +164,7 @@ USER_CONFIRMED_SUBMISSION_EVIDENCE = "用户确认：外部平台已成功提交
 
 def _user_status(status: str) -> str:
     """Project internal execution states onto the user-facing status labels."""
-    return status if status in {"submitted", "rejected", "interview", "skipped"} else "ready_to_apply"
+    return status if status in {"submitted", "rejected", "interview", "offer", "skipped", "unavailable"} else "ready_to_apply"
 
 
 def _latest_active_attempt(service: ApplicationAttempts, job_id: str) -> dict[str, str] | None:
@@ -214,6 +217,10 @@ def _dashboard_action_payload(
     display_status = _user_status(row.get("status", ""))
     attempt = _latest_active_attempt(service, job_id)
     attempt_status = (attempt or {}).get("status", "")
+    timezone_name = str(service.platform_config.get("timezone", "Australia/Melbourne"))
+    submitted_today = job_id in submitted_today_job_ids(
+        board.load_rows(), timezone_name,
+    )
     return {
         "ok": True,
         "message": message,
@@ -226,8 +233,11 @@ def _dashboard_action_payload(
             else STATUS_LABELS.get(display_status, display_status),
         ),
         "dismissed": row.get("status") == "skipped",
+        "unavailable": row.get("status") == "unavailable",
+        "unavailable_reason": row.get("unavailable_reason", ""),
         "submission_evidence": row.get("submission_evidence", ""),
         "submitted_at": row.get("submitted_at", ""),
+        "submitted_today": submitted_today,
         "next_action": row.get("next_action", ""),
         "attempt_status": attempt_status,
         "attempt_status_label": ATTEMPT_LABELS.get(attempt_status, attempt_status),
@@ -402,6 +412,7 @@ def _unified_dashboard_rows(
     now: datetime | None = None,
     latest_run_id: str = "",
     ranked_path: Path | None = None,
+    submitted_today_ids: set[str] | None = None,
 ) -> list[dict[str, str]]:
     """Decorate Dashboard rows for the result-style unified UI without changing CSV data."""
     ranked = _ranked_lookup(ranked_path)
@@ -466,6 +477,10 @@ def _unified_dashboard_rows(
                 if platform_mode == "auto_if_allowed"
                 else "Platform policy requires manual submission"
             )
+        duplicate_urls = [
+            item for item in (row.get("duplicate_urls") or "").split("; ")
+            if item.strip()
+        ]
         row.update({
             # The UI range starts at -1 so unscored rows stay visible at the bottom.
             "score_int": str(score if score >= 0 else -1),
@@ -473,7 +488,6 @@ def _unified_dashboard_rows(
             "score_class": "high" if score >= 80 else "mid" if score >= 60 else "low",
             "display_status": display_status,
             "status_label": status_label,
-            "mode_label": MODE_LABELS.get(row.get("application_mode", ""), row.get("application_mode") or "人工复核"),
             "freshness_label": FRESHNESS_LABELS.get(freshness, freshness),
             "freshness_bucket": freshness,
             "posted_display": posted_display,
@@ -483,11 +497,18 @@ def _unified_dashboard_rows(
             "posted_at_raw": display_timestamp,
             "source_label": (row.get("source") or "unknown").upper(),
             "today_action": "1" if row.get("job_id") in today_ids else "0",
+            "submitted_today": "1" if row.get("job_id") in (submitted_today_ids or set()) else "0",
             "latest_run": "1" if latest_run_id and row.get("last_run_id") == latest_run_id else "0",
             "attempt_status": attempt_status,
             "attempt_status_label": ATTEMPT_LABELS.get(attempt_status, attempt_status),
             "attempt_id": attempt.get("attempt_id", ""),
             "attempt_readiness": attempt.get("readiness", ""),
+            "duplicate_count": str(1 + len(duplicate_urls)) if url else str(len(duplicate_urls)),
+            "duplicate_urls_list": duplicate_urls,
+            "unavailable_reason": row.get("unavailable_reason", ""),
+            "unavailable_reason_label": AVAILABILITY_REASON_LABELS.get(
+                row.get("unavailable_reason", ""), row.get("unavailable_reason", "")
+            ),
             "platform_mode": platform_mode,
             "platform_mode_label": PLATFORM_MODE_LABELS.get(platform_mode, platform_mode),
             "apply_button_label": apply_button_label,
@@ -1071,7 +1092,7 @@ SCORING_RULES_HTML = """
   .rules-editor { min-height:65vh; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
                   font-size:12.5px; line-height:1.55; }
   .rule-meta { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-</style></head><body>
+</style></head><body data-view="{% if show_dismissed %}dismissed{% elif show_unavailable %}unavailable{% endif %}">
 <header class="top"><h1>DeepSeek 评分规则</h1><nav class="tabs">
   <a href="/">设置</a><a href="/profile">档案</a><a href="/scoring-rules" class="active">评分规则</a><a href="/dashboard">Dashboard</a>
 </nav></header>
@@ -1095,7 +1116,7 @@ DASHBOARD_HTML = """
 <html lang="zh"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Dashboard · jobhunt-au</title><style>""" + BASE_STYLE + """
-  .stats { display:grid; grid-template-columns:repeat(6,1fr); gap:8px; margin:4px 0 16px; }
+  .stats { display:grid; grid-template-columns:repeat(8,1fr); gap:8px; margin:4px 0 16px; }
   .stat { min-width:0; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:10px 12px; }
   .stat .n { font-size:20px; font-weight:600; line-height:1.2; }
   .stat .k { color:var(--text-dim); font-size:11.5px; margin-top:2px; white-space:nowrap; }
@@ -1160,7 +1181,7 @@ DASHBOARD_HTML = """
   .empty { color:var(--text-dim); font-size:14px; margin-top:40px; text-align:center; }.no-match { color:var(--text-dim); font-size:14px; margin-top:30px; text-align:center; }
   .load-more { display:flex; justify-content:center; margin:18px 0 8px; }
   .load-more[hidden] { display:none; }
-  @media (max-width:850px){.stats{grid-template-columns:repeat(3,1fr)}}
+  @media (max-width:850px){.stats{grid-template-columns:repeat(4,1fr)}}
   @media (max-width:600px){.stats{grid-template-columns:repeat(2,1fr)}.today-banner{align-items:flex-start; flex-direction:column}.rules-card{grid-template-columns:1fr}.rule-grid{grid-template-columns:1fr}.filter-row{gap:9px}.filters label{width:100%}#q{width:100%}.count{margin-left:0}.status-tools .btn{flex:1;justify-content:center}.status-form{grid-template-columns:1fr}.status-form .full{grid-column:1}.status-modal{padding:10px}.status-dialog{max-height:calc(100vh - 20px);padding:16px}}
 </style></head><body>
 <header class="top"><h1>Dashboard</h1><nav class="tabs">
@@ -1173,7 +1194,9 @@ DASHBOARD_HTML = """
   <div class="stat"><div class="n" id="stat-total">{{ stats.total }}</div><div class="k">全部机会</div></div>
   <div class="stat high"><div class="n" id="stat-within-24h">{{ stats.within_24h }}</div><div class="k">24h 内发布</div></div>
   <div class="stat"><div class="n" id="stat-ready-to-apply">{{ stats.ready_to_apply }}</div><div class="k">待投递</div></div>
-  <div class="stat high"><div class="n" id="stat-submitted">{{ stats.submitted }}</div><div class="k">已提交</div></div>
+  <div class="stat high"><div class="n" id="stat-submitted">{{ stats.submitted }}</div><div class="k">累计已提交</div></div>
+  <div class="stat high"><div class="n" id="stat-today-submitted">{{ stats.today_submitted }}</div><div class="k">今日提交</div></div>
+  <div class="stat mid"><div class="n" id="stat-offer">{{ stats.offer }}</div><div class="k">有 Offer</div></div>
   <div class="stat danger"><div class="n" id="stat-rejected">{{ stats.rejected }}</div><div class="k">被拒绝</div></div>
   <div class="stat mid"><div class="n" id="stat-interview">{{ stats.interview }}</div><div class="k">面试中</div></div>
 </div>
@@ -1184,8 +1207,8 @@ DASHBOARD_HTML = """
     <span class="hint">最近同步 {{ latest_sync_count }} 条 · {{ latest_sync_display }}{% if latest_run_id %} · 批次 {{ latest_run_id }}{% endif %}</span>
     <button type="button" class="btn" onclick="setQueue('latest', document.querySelector('[data-v=latest]'))">查看最近同步</button>
     <button type="button" class="btn" onclick="setSeg('freshness', 'within_24h', document.querySelector('[data-v=within_24h]'))">只看 24h</button>
-    {% if show_dismissed %}<a class="btn" href="{{ url_for('dashboard_view') }}">返回工作机会</a>
-    {% else %}<a class="btn" id="dismissed-link" href="{{ url_for('dashboard_view', view='dismissed') }}"{% if not dismissed_count %} hidden{% endif %}>已忽略 <span id="dismissed-count">{{ dismissed_count }}</span> 个</a>{% endif %}
+    {% if show_dismissed or show_unavailable %}<a class="btn" href="{{ url_for('dashboard_view') }}">返回工作机会</a>
+    {% else %}<a class="btn" id="dismissed-link" href="{{ url_for('dashboard_view', view='dismissed') }}"{% if not dismissed_count %} hidden{% endif %}>已忽略 <span id="dismissed-count">{{ dismissed_count }}</span> 个</a><a class="btn" id="unavailable-link" href="{{ url_for('dashboard_view', view='unavailable') }}"{% if not unavailable_count %} hidden{% endif %}>已失效 <span id="unavailable-count">{{ unavailable_count }}</span> 个</a>{% endif %}
   </div>
 </div>
 
@@ -1195,7 +1218,7 @@ DASHBOARD_HTML = """
 </div>
 
 {% if not rows %}
-<p class="empty">{% if show_dismissed %}暂无已忽略岗位。<a href="{{ url_for('dashboard_view') }}">返回工作机会</a>{% else %}当前列表没有工作机会 —— 先在设置面板运行“抓取 + 打分”，或查看已忽略岗位。{% endif %}</p>
+<p class="empty">{% if show_dismissed %}暂无已忽略岗位。<a href="{{ url_for('dashboard_view') }}">返回工作机会</a>{% elif show_unavailable %}暂无已失效岗位。<a href="{{ url_for('dashboard_view') }}">返回工作机会</a>{% else %}当前列表没有工作机会 —— 先在设置面板运行“抓取 + 打分”，或查看已忽略/已失效岗位。{% endif %}</p>
 {% else %}
 <div class="filters">
   <div class="filter-row">
@@ -1203,11 +1226,10 @@ DASHBOARD_HTML = """
     <label>搜索 <input type="text" id="q" placeholder="公司 / 职位 / 匹配理由" oninput="filterRows(true)"></label>
   </div>
   <div class="filter-row">
-    <label>视图 <span class="seg"><button class="on" data-v="all" onclick="setQueue('all', this)">全部</button><button data-v="latest" onclick="setQueue('latest', this)">最近同步</button><button data-v="today" onclick="setQueue('today', this)">今日行动</button><button data-v="history" onclick="setQueue('history', this)">历史</button></span></label>
-    <label>状态 <span class="seg"><button class="on" data-v="all" onclick="setSeg('status', 'all', this)">全部</button><button data-v="ready_to_apply" onclick="setSeg('status', 'ready_to_apply', this)">待投递</button><button data-v="submitted" onclick="setSeg('status', 'submitted', this)">已提交</button><button data-v="rejected" onclick="setSeg('status', 'rejected', this)">被拒绝</button><button data-v="interview" onclick="setSeg('status', 'interview', this)">面试中</button></span></label>
+    <label>视图 <span class="seg"><button class="on" data-v="all" onclick="setQueue('all', this)">全部</button><button data-v="latest" onclick="setQueue('latest', this)">最近同步</button><button data-v="today" onclick="setQueue('today', this)">今日行动（待处理）</button><button data-v="submitted_today" onclick="setQueue('submitted_today', this)">今日提交</button><button data-v="history" onclick="setQueue('history', this)">历史</button></span></label>
+    <label>状态 <span class="seg"><button data-v="all" onclick="setSeg('status', 'all', this)">全部</button><button class="on" data-v="ready_to_apply" onclick="setSeg('status', 'ready_to_apply', this)">待投递</button><button data-v="submitted" onclick="setSeg('status', 'submitted', this)">已提交</button><button data-v="offer" onclick="setSeg('status', 'offer', this)">有 Offer</button><button data-v="rejected" onclick="setSeg('status', 'rejected', this)">被拒绝</button><button data-v="interview" onclick="setSeg('status', 'interview', this)">面试中</button>{% if show_unavailable %}<button data-v="unavailable" onclick="setSeg('status', 'unavailable', this)">岗位已失效</button>{% endif %}</span></label>
   </div>
   <div class="filter-row">
-    <label>模式 <span class="seg"><button class="on" data-v="all" onclick="setSeg('mode', 'all', this)">全部</button><button data-v="targeted" onclick="setSeg('mode', 'targeted', this)">精准</button><button data-v="broad" onclick="setSeg('mode', 'broad', this)">海投</button><button data-v="manual_review" onclick="setSeg('mode', 'manual_review', this)">人工复核</button></span></label>
     <label>担保 <span class="seg"><button class="on" data-v="all" onclick="setSeg('sponsor', 'all', this)">全部</button><button data-v="explicit_yes" onclick="setSeg('sponsor', 'explicit_yes', this)">可担保</button><button data-v="unknown" onclick="setSeg('sponsor', 'unknown', this)">未提及</button><button data-v="explicit_no" onclick="setSeg('sponsor', 'explicit_no', this)">不担保</button></span></label>
     <span class="count" id="count"></span>
   </div>
@@ -1218,24 +1240,24 @@ DASHBOARD_HTML = """
   </div>
 </div>
 
-<div class="section-heading"><div><h2>{% if show_dismissed %}已忽略岗位{% else %}工作机会{% endif %}</h2><p>{% if show_dismissed %}这些岗位不会出现在默认列表中；需要时可以恢复到待审核。{% else %}按匹配分降序排列；状态和历史保留在同一张卡片里。{% endif %}</p></div><span class="count" id="count-secondary"></span></div>
+<div class="section-heading"><div><h2>{% if show_dismissed %}已忽略岗位{% elif show_unavailable %}已失效岗位{% else %}工作机会{% endif %}</h2><p>{% if show_dismissed %}这些岗位不会出现在默认列表中；需要时可以恢复到待审核。{% elif show_unavailable %}这些岗位因招聘方状态不可用而归档，不等同于你主动不想要。{% else %}按匹配分降序排列；状态和历史保留在同一张卡片里。{% endif %}</p></div><span class="count" id="count-secondary"></span></div>
 <div id="rows">
 {% for r in rows %}
 {% set sig = r.sponsorship_signal or 'unknown' %}
-<div class="card row-item" data-score="{{ r.score_int }}" data-text="{{ (r.title ~ ' ' ~ r.company ~ ' ' ~ r.summary ~ ' ' ~ r.reason ~ ' ' ~ r.matched ~ ' ' ~ r.missing)|lower }}" data-status="{{ r.display_status }}" data-mode="{{ r.application_mode or 'manual_review' }}" data-sponsor="{{ sig }}" data-source="{{ r.source }}" data-freshness="{{ r.freshness_bucket or 'unknown' }}" data-today="{{ r.today_action }}" data-latest="{{ r.latest_run }}" data-posted-at="{{ r.posted_at_raw }}">
+<div class="card row-item" data-score="{{ r.score_int }}" data-text="{{ (r.title ~ ' ' ~ r.company ~ ' ' ~ r.summary ~ ' ' ~ r.reason ~ ' ' ~ r.matched ~ ' ' ~ r.missing)|lower }}" data-status="{{ r.display_status }}" data-sponsor="{{ sig }}" data-source="{{ r.source }}" data-freshness="{{ r.freshness_bucket or 'unknown' }}" data-today="{{ r.today_action }}" data-submitted-today="{{ r.submitted_today }}" data-latest="{{ r.latest_run }}" data-posted-at="{{ r.posted_at_raw }}">
   <div class="row-head">
     <span class="badge {{ r.score_class }}">{{ r.score_label }}</span>
     <span class="row-title"><a href="{{ url_for('dashboard_detail', job_id=r.job_id) }}">{{ r.title }}</a></span>
     <span class="row-company">@ {{ r.company }}</span>
     <span class="chip accent" data-status-chip>{{ r.status_label }}</span>
-    <span class="chip">{{ r.mode_label }}</span>
     <span class="chip" data-freshness-chip="1">{{ r.freshness_label }}</span>
     {% if sig == 'explicit_yes' %}<span class="chip yes">可担保</span>{% elif sig == 'explicit_no' %}<span class="chip no">不担保</span>{% else %}<span class="chip unknown">担保未提及</span>{% endif %}
     <span class="source-tag">{{ r.source_label }}</span>
   </div>
-  <div class="meta">{{ r.location or '地点未知' }} · {{ r.posted_label }} {{ r.posted_display }}{% if r.posted_relative %}（<span data-posted-relative="1">{{ r.posted_relative }}</span>）{% endif %} · {{ r.salary_raw or '薪资未列出' }} · {{ r.resume_id or '未选择简历' }}</div>
+  <div class="meta">{{ r.location or '地点未知' }} · {{ r.posted_label }} {{ r.posted_display }}{% if r.posted_relative %}（<span data-posted-relative="1">{{ r.posted_relative }}</span>）{% endif %} · {{ r.salary_raw or '薪资未列出' }} · {{ r.resume_id or '未选择简历' }}{% if r.duplicate_count|int > 1 %} · 已合并 {{ r.duplicate_count }} 个来源{% endif %}</div>
   <div class="reason"><b>JD 摘要：</b>{{ r.summary or 'DeepSeek 暂未返回摘要。' }}</div>
-  <div class="score-detail"><b>评分理由：</b>{{ r.reason or '暂无匹配理由，需人工复核。' }}</div>
+  <div class="score-detail"><b>评分理由：</b>{{ r.reason or '暂无匹配理由，需要进一步判断。' }}</div>
+  {% if r.status == 'unavailable' %}<div class="score-detail"><b>岗位状态：</b>{{ r.unavailable_reason_label or r.unavailable_reason or '岗位已失效' }}</div>{% endif %}
   <div class="score-detail">简历匹配：{{ r.resume_fit_score or '—' }}/100{% if r.resume_reason %} · {{ r.resume_reason }}{% endif %}{% if r.eligibility_reason %} · {{ r.eligibility_reason }}{% endif %}</div>
   <div class="tags">{% for m in (r.matched or '').split(',') if m.strip() %}<span class="tag m">{{ m.strip() }}</span>{% endfor %}{% for x in (r.missing or '').split(',') if x.strip() %}<span class="tag x">缺 {{ x.strip() }}</span>{% endfor %}</div>
   <div class="card-actions"><a href="{{ r.url }}" target="_blank" rel="noopener">打开岗位链接 →</a><a href="{{ url_for('dashboard_detail', job_id=r.job_id) }}">查看详情与历史 →</a><span class="meta" data-next-action{% if not r.next_action %} hidden{% endif %}>{% if r.next_action %}下一步：{{ r.next_action }}{% endif %}</span></div>
@@ -1246,13 +1268,20 @@ DASHBOARD_HTML = """
       <input type="hidden" name="return_to" value="dashboard">
       <button class="btn primary" type="submit">恢复到工作机会</button>
     </form>
+    {% elif r.status == 'unavailable' %}
+    <form method="post" action="{{ url_for('dashboard_restore_unavailable', job_id=r.job_id) }}" data-restore-unavailable onsubmit="return restoreUnavailable(event, this)">
+      <input type="hidden" name="action_token" value="{{ action_token }}">
+      <input type="hidden" name="return_to" value="dashboard">
+      <button class="btn primary" type="submit">恢复到工作机会</button>
+    </form>
     {% else %}
-    {% if r.status not in ['submitted', 'follow_up', 'rejected', 'interview', 'withdrawn'] %}
+    {% if r.status not in ['submitted', 'follow_up', 'rejected', 'interview', 'offer', 'withdrawn'] %}
     <form method="post" action="{{ url_for('dashboard_dismiss', job_id=r.job_id) }}" data-not-interested onsubmit="return dismissJob(event, this)">
       <input type="hidden" name="action_token" value="{{ action_token }}">
       <input type="hidden" name="return_to" value="dashboard">
       <button class="btn" type="submit">不想要</button>
     </form>
+    <button type="button" class="btn" data-action="{{ url_for('dashboard_transition', job_id=r.job_id) }}" data-title="{{ r.title }} @ {{ r.company }}" data-current="{{ r.display_status }}" data-mode="unavailable" onclick="openUnavailableDialog(this)">岗位已失效</button>
     {% endif %}
     <form method="post" action="{{ url_for('confirm_submitted', job_id=r.job_id) }}"
       data-confirm-submitted onsubmit="return confirmSubmitted(event, this)"{% if r.display_status != 'ready_to_apply' %} hidden{% endif %}>
@@ -1268,8 +1297,10 @@ DASHBOARD_HTML = """
       onclick="openStatusDialog(this)">转换申请状态</button>
     {% endif %}
   </div>
-  {% if r.application_mode == 'manual_review' %}
-  <div class="apply-panel"><span class="action-lock">当前规则要求人工复核职位级别或资格后才能投递。</span></div>
+  {% if r.status in ['skipped', 'unavailable'] %}
+  <div class="apply-panel"><span class="action-lock">该岗位已归档，不会进入投递选择。</span></div>
+  {% elif r.application_mode not in ['broad', 'targeted'] %}
+  <div class="apply-panel"><span class="action-lock">当前岗位暂不进入自动投递，请先查看岗位链接并自行判断。</span></div>
   {% elif r.application_mode in ['broad', 'targeted'] %}
   <div class="apply-panel" id="apply-panel-{{ r.job_id }}">
     <div class="apply-copy"><strong>{{ r.platform_mode_label }}</strong><span>{{ r.apply_explanation }} 只有成功确认页才会记为“已提交”。</span></div>
@@ -1312,6 +1343,12 @@ DASHBOARD_HTML = """
       <label>原因或备注
         <input type="text" id="status-reason" name="reason" placeholder="例如：收到面试邀请">
       </label>
+      <label class="full" id="availability-fields" hidden>失效原因
+        <select id="availability-reason" name="unavailable_reason">
+          <option value="">请选择岗位为何不可用</option>
+          {% for reason, label in availability_reason_labels.items() %}<option value="{{ reason }}">{{ label }}</option>{% endfor %}
+        </select>
+      </label>
       <p class="same-status" id="same-status" hidden>请选择与当前状态不同的新状态。</p>
       <p class="action-error" id="status-dialog-error" hidden></p>
       <div class="submission-fields full" id="submission-fields" hidden>
@@ -1331,7 +1368,7 @@ DASHBOARD_HTML = """
 </div>
 
 <script>
-const state = { queue: 'all', status: 'all', mode: 'all', sponsor: 'all', source: 'all', freshness: 'all' };
+const state = { queue: 'all', status: 'ready_to_apply', sponsor: 'all', source: 'all', freshness: 'all' };
 const freshnessPriorityHours = {{ freshness_priority_hours }};
 const freshnessRecentHours = {{ freshness_recent_hours }};
 const freshnessLabels = {within_24h:'24 小时内', within_3d:'3 天内', older:'较早发布', unknown:'发布时间未知'};
@@ -1343,7 +1380,7 @@ function syncRange(){document.getElementById('min-score').value=document.getElem
 function syncNumber(){let v=parseInt(document.getElementById('min-score').value||'-1',10);v=Math.max(-1,Math.min(100,isNaN(v)?-1:v));document.getElementById('min-range').value=v;filterRows(true);}
 function setQueue(value, btn){state.queue=value;document.querySelectorAll('.filters .seg').forEach(seg=>{if(seg.querySelector('[onclick^="setQueue"]'))seg.querySelectorAll('button').forEach(b=>b.classList.toggle('on',b.dataset.v===value));});if(btn&&btn.parentNode&&btn.parentNode.classList.contains('seg'))btn.parentNode.querySelectorAll('button').forEach(b=>b.classList.toggle('on',b.dataset.v===value));filterRows(true);}
 function setSeg(group,value,btn){if(!btn)return;state[group]=value;btn.parentNode.querySelectorAll('button').forEach(b=>b.classList.remove('on'));btn.classList.add('on');filterRows(true);}
-function resetFilters(){document.getElementById('min-score').value=-1;document.getElementById('min-range').value=-1;document.getElementById('q').value='';state.queue='all';state.status='all';state.mode='all';state.sponsor='all';state.source='all';state.freshness='all';document.querySelectorAll('.seg').forEach(seg=>seg.querySelectorAll('button').forEach(b=>b.classList.toggle('on',b.dataset.v==='all')));filterRows(true);}
+function resetFilters(){document.getElementById('min-score').value=-1;document.getElementById('min-range').value=-1;document.getElementById('q').value='';state.queue='all';state.status='ready_to_apply';state.sponsor='all';state.source='all';state.freshness='all';document.querySelectorAll('.seg').forEach(seg=>{const desired=seg.querySelector('[data-v="ready_to_apply"]')?'ready_to_apply':'all';seg.querySelectorAll('button').forEach(b=>b.classList.toggle('on',b.dataset.v===desired));});filterRows(true);}
 function filterRows(resetLimit=false){
   if(resetLimit)visibleLimit=pageSize;
   const min=parseInt(document.getElementById('min-score').value||'-1',10);
@@ -1351,8 +1388,8 @@ function filterRows(resetLimit=false){
   const matches=[];
   document.querySelectorAll('.row-item').forEach(el=>{
     const score=parseInt(el.dataset.score,10);
-    const queueOk=state.queue==='all'||(state.queue==='latest'&&el.dataset.latest==='1')||(state.queue==='today'&&el.dataset.today==='1')||(state.queue==='history'&&el.dataset.today!=='1');
-    const ok=score>=min&&queueOk&&el.dataset.text.includes(q)&&(state.status==='all'||el.dataset.status===state.status)&&(state.mode==='all'||el.dataset.mode===state.mode)&&(state.sponsor==='all'||el.dataset.sponsor===state.sponsor)&&(state.source==='all'||el.dataset.source===state.source)&&(state.freshness==='all'||el.dataset.freshness===state.freshness);
+    const queueOk=state.queue==='all'||(state.queue==='latest'&&el.dataset.latest==='1')||(state.queue==='today'&&el.dataset.today==='1')||(state.queue==='submitted_today'&&el.dataset.submittedToday==='1')||(state.queue==='history'&&el.dataset.today!=='1');
+    const ok=score>=min&&queueOk&&el.dataset.text.includes(q)&&(state.status==='all'||el.dataset.status===state.status)&&(state.sponsor==='all'||el.dataset.sponsor===state.sponsor)&&(state.source==='all'||el.dataset.source===state.source)&&(state.freshness==='all'||el.dataset.freshness===state.freshness);
     el.style.display='none';
     if(ok)matches.push(el);
   });
@@ -1410,7 +1447,7 @@ function openStatusDialog(button){
   select.value=button.dataset.current;
   document.getElementById('status-choice').hidden=false;
   document.getElementById('status-dialog-title').textContent='转换申请状态';
-  document.getElementById('status-dialog-hint').textContent='可在待投递、已提交、被拒绝和面试中之间转换；变化会写入历史记录。';
+  document.getElementById('status-dialog-hint').textContent='可在待投递、已提交、面试中、有 Offer 和其他状态之间转换；变化会写入历史记录。';
   document.getElementById('status-save').textContent='保存新状态';
   document.getElementById('status-dialog-error').hidden=true;
   document.getElementById('status-dialog-error').textContent='';
@@ -1418,6 +1455,15 @@ function openStatusDialog(button){
   modal.hidden=false;
   document.body.classList.add('modal-open');
   requestAnimationFrame(()=>select.focus());
+}
+function openUnavailableDialog(button){
+  openStatusDialog(button);
+  const select=document.getElementById('status-select');
+  select.value='unavailable';
+  document.getElementById('status-dialog-title').textContent='标记岗位已失效';
+  document.getElementById('status-dialog-hint').textContent='这表示招聘方已经无法继续招聘，不等同于你主动不想要；请选择具体原因。';
+  updateStatusDialog();
+  requestAnimationFrame(()=>document.getElementById('availability-reason').focus());
 }
 function closeStatusDialog(){
   const modal=document.getElementById('status-modal');
@@ -1435,15 +1481,20 @@ function updateStatusDialog(){
   fields.hidden=!submitted;
   evidence.required=submitted;
   confirmed.required=submitted;
+  const unavailable=select.value==='unavailable';
+  const availabilityFields=document.getElementById('availability-fields');
+  const availabilityReason=document.getElementById('availability-reason');
+  availabilityFields.hidden=!unavailable;
+  availabilityReason.required=unavailable;
   const same=modal.dataset.mode==='change'&&select.value===modal.dataset.current;
   document.getElementById('same-status').hidden=!same;
   const reason=document.getElementById('status-reason');
-  const returning=select.value==='ready_to_apply'&&['submitted','rejected','interview'].includes(modal.dataset.current);
+  const returning=select.value==='ready_to_apply'&&['submitted','rejected','interview','offer','skipped','unavailable'].includes(modal.dataset.current);
   reason.required=returning;
-  reason.placeholder=returning?'请说明为什么重新进入待投递':'例如：收到面试邀请';
+  reason.placeholder=unavailable?'可补充看到的页面提示（可选）':returning?'请说明为什么重新进入待投递':'例如：收到面试邀请';
   document.getElementById('status-save').disabled=same;
 }
-const statusStatIds={total:'stat-total',within_24h:'stat-within-24h',ready_to_apply:'stat-ready-to-apply',submitted:'stat-submitted',rejected:'stat-rejected',interview:'stat-interview'};
+const statusStatIds={total:'stat-total',within_24h:'stat-within-24h',ready_to_apply:'stat-ready-to-apply',submitted:'stat-submitted',today_submitted:'stat-today-submitted',offer:'stat-offer',rejected:'stat-rejected',interview:'stat-interview'};
 function changeStat(status,delta){
   const target=document.getElementById(statusStatIds[status]);
   if(!target)return;
@@ -1454,6 +1505,10 @@ function updateStatusStats(previous,next){
   if(previous===next)return;
   changeStat(previous,-1);
   changeStat(next,1);
+}
+function updateTodaySubmittedStat(previousToday,nextToday){
+  if(previousToday===nextToday)return;
+  changeStat('today_submitted',nextToday?1:-1);
 }
 function clearCardActionError(card){
   const error=card&&card.querySelector('[data-action-error]');
@@ -1477,7 +1532,11 @@ function updateCardFromAction(data,source){
   const previous=card.dataset.status;
   const next=data.display_status||previous;
   updateStatusStats(previous,next);
+  const previousToday=card.dataset.submittedToday==='1';
+  const nextToday=data.submitted_today===true||data.submitted_today==='1';
+  updateTodaySubmittedStat(previousToday,nextToday);
   card.dataset.status=next;
+  card.dataset.submittedToday=nextToday?'1':'0';
   const statusChip=card.querySelector('[data-status-chip]');
   if(statusChip&&data.status_label)statusChip.textContent=data.status_label;
   const nextAction=card.querySelector('[data-next-action]');
@@ -1525,14 +1584,17 @@ async function confirmSubmitted(event,form){
   }
   return false;
 }
-function removeCardFromDashboard(card, previousStatus, wasFresh){
+function removeCardFromDashboard(card, previousStatus, wasFresh, archiveType=''){
   if(!card)return;
   dashboardTotal=Math.max(0,dashboardTotal-1);
-  const dismissedLink=document.getElementById('dismissed-link');
-  const dismissedCount=document.getElementById('dismissed-count');
-  if(dismissedLink&&dismissedCount){
-    dismissedCount.textContent=String(parseInt(dismissedCount.textContent||'0',10)+1);
-    dismissedLink.hidden=false;
+  const archiveIds=archiveType==='unavailable'
+    ? ['unavailable-link','unavailable-count']
+    : archiveType==='dismissed' ? ['dismissed-link','dismissed-count'] : [];
+  const archiveLink=document.getElementById(archiveIds[0]);
+  const archiveCount=document.getElementById(archiveIds[1]);
+  if(archiveLink&&archiveCount){
+    archiveCount.textContent=String(parseInt(archiveCount.textContent||'0',10)+1);
+    archiveLink.hidden=false;
   }
   changeStat('total',-1);
   if(wasFresh)changeStat('within_24h',-1);
@@ -1551,7 +1613,7 @@ async function dismissJob(event,form){
   try{
     const data=await postDashboardAction(form);
     if(!data.dismissed)throw new Error('服务器未确认岗位已移除');
-    removeCardFromDashboard(card,card.dataset.status,card.dataset.freshness==='within_24h');
+    removeCardFromDashboard(card,card.dataset.status,card.dataset.freshness==='within_24h','dismissed');
   }catch(error){
     showCardActionError(card,error.message);
     button.disabled=false;
@@ -1559,6 +1621,21 @@ async function dismissJob(event,form){
   return false;
 }
 async function restoreDismissed(event,form){
+  event.preventDefault();
+  const card=form.closest('.row-item');
+  const button=form.querySelector('button');
+  clearCardActionError(card);
+  button.disabled=true;
+  try{
+    await postDashboardAction(form);
+    removeCardFromDashboard(card,card.dataset.status,false);
+  }catch(error){
+    showCardActionError(card,error.message);
+    button.disabled=false;
+  }
+  return false;
+}
+async function restoreUnavailable(event,form){
   event.preventDefault();
   const card=form.closest('.row-item');
   const button=form.querySelector('button');
@@ -1582,7 +1659,14 @@ async function saveStatus(event,form){
   button.disabled=true;
   try{
     const data=await postDashboardAction(form);
-    updateCardFromAction(data,statusTrigger);
+    const card=statusTrigger&&statusTrigger.closest?statusTrigger.closest('.row-item'):null;
+    const currentView=document.body.dataset.view||'';
+    const nextView=data.status==='skipped'?'dismissed':data.status==='unavailable'?'unavailable':'';
+    if(nextView!==currentView&&(nextView||currentView)){
+      removeCardFromDashboard(card,card&&card.dataset.status,card&&card.dataset.freshness==='within_24h',nextView);
+    }else{
+      updateCardFromAction(data,statusTrigger);
+    }
     closeStatusDialog();
   }catch(actionError){
     error.textContent=actionError.message;
@@ -1650,13 +1734,16 @@ DASHBOARD_DETAIL_HTML = """
 <html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{ row.title }} · Dashboard</title><style>""" + BASE_STYLE + """</style></head><body>
 <header class="top"><h1>岗位详情</h1><nav class="tabs"><a href="/dashboard" class="active">← Dashboard</a><a href="/profile">档案</a><a href="/scoring-rules">评分规则</a></nav></header>
 <div class="card"><h2>{{ row.title }} @ {{ row.company }}</h2><p class="hint">{{ row.location or '地点未知' }} · {{ row.posted_label }} {{ row.posted_display }}{% if row.posted_relative %}（{{ row.posted_relative }}）{% endif %} · {{ row.freshness_label }} · <a href="{{ row.url }}" target="_blank" rel="noopener">打开原始岗位链接</a></p>
-<p><b>JD 摘要：</b>{{ row.job_summary or 'DeepSeek 暂未返回摘要。' }}<br><b>岗位匹配：</b>{{ row.job_fit_score or '—' }}/100 — {{ row.job_fit_reason or '—' }}<br><b>简历：</b>{{ row.resume_id or '—' }} · {{ row.resume_fit_score or '—' }}/100 — {{ row.resume_reason or '—' }}<br><b>申请路径：</b>{{ row.application_mode or 'manual_review' }} — {{ row.eligibility_reason or '—' }}</p>
+{% if row.duplicate_urls %}<p class="hint">同一岗位已合并其他来源链接：{% for duplicate_url in row.duplicate_urls.split('; ') if duplicate_url %}<a href="{{ duplicate_url }}" target="_blank" rel="noopener">{{ duplicate_url }}</a>{% if not loop.last %} · {% endif %}{% endfor %}</p>{% endif %}
+{% if row.status == 'unavailable' %}<p class="hint">岗位不可用原因：{{ row.unavailable_reason_label or row.unavailable_reason or '未分类' }}</p>{% endif %}
+<p><b>JD 摘要：</b>{{ row.job_summary or 'DeepSeek 暂未返回摘要。' }}<br><b>岗位匹配：</b>{{ row.job_fit_score or '—' }}/100 — {{ row.job_fit_reason or '—' }}<br><b>简历：</b>{{ row.resume_id or '—' }} · {{ row.resume_fit_score or '—' }}/100 — {{ row.resume_reason or '—' }}<br><b>资格判断：</b>{{ row.eligibility_reason or '—' }}</p>
 {% if row.artifact_path %}<p class="hint">材料目录：{{ row.artifact_path }}</p>{% endif %}</div>
 <div class="card"><h2>更新记录</h2><p class="hint">Dashboard 是展示账本。只有平台成功页或确认文本可把岗位标记为 submitted；Agent 选择、打开页面或填完表单都不算提交。</p>
 <form method="post" action="{{ url_for('dashboard_transition', job_id=row.job_id) }}">
 <input type="hidden" name="action_token" value="{{ action_token }}">
 <label>状态</label><select name="status">{% for status in statuses %}<option value="{{ status }}" {% if status == row.display_status %}selected{% endif %}>{{ status_labels[status] }}</option>{% endfor %}</select>
 <label>原因或备注</label><textarea name="reason" rows="2"></textarea>
+<label>岗位不可用原因（标记“岗位已失效”时必选）</label><select name="unavailable_reason"><option value="">请选择</option>{% for reason, label in availability_reason_labels.items() %}<option value="{{ reason }}" {% if reason == row.unavailable_reason %}selected{% endif %}>{{ label }}</option>{% endfor %}</select>
 <label>下一步动作</label><input type="text" name="next_action" value="{{ row.next_action }}">
 <label>备注</label><textarea name="notes" rows="3">{{ row.notes }}</textarea>
 <label>提交证据（submitted 时必填）</label><input type="text" name="submission_evidence" value="{{ row.submission_evidence }}" placeholder="例如：成功页文本或确认 URL">
@@ -1742,11 +1829,18 @@ def dashboard_view():
     cfg = load_config()
     board = _dashboard(cfg)
     raw_rows = board.load_rows()
-    show_dismissed = request.args.get("view") == "dismissed"
+    view = request.args.get("view", "")
+    show_dismissed = view == "dismissed"
+    show_unavailable = view == "unavailable"
     dismissed_count = sum(1 for row in raw_rows if row.get("status") == "skipped")
+    unavailable_count = sum(1 for row in raw_rows if row.get("status") == "unavailable")
     visible_raw_rows = [
         row for row in raw_rows
-        if (row.get("status") == "skipped") == show_dismissed
+        if (
+            row.get("status") == "skipped" if show_dismissed
+            else row.get("status") == "unavailable" if show_unavailable
+            else row.get("status") not in {"skipped", "unavailable"}
+        )
     ]
     queues = board.daily_queues()
     timezone_name = str(
@@ -1756,6 +1850,7 @@ def dashboard_view():
         raw_rows, timezone_name,
     )
     today_ids = {row.get("job_id", "") for row in queues["today"]}
+    submitted_today_ids = submitted_today_job_ids(raw_rows, timezone_name)
     attempts_by_job: dict[str, dict[str, str]] = {}
     for attempt in _attempts(cfg).load_rows():
         job_id = attempt.get("job_id", "")
@@ -1771,6 +1866,7 @@ def dashboard_view():
         freshness_config=cfg,
         latest_run_id=latest_run_id,
         ranked_path=ranked_path,
+        submitted_today_ids=submitted_today_ids,
     )
     try:
         _, scoring_rules, scoring_rules_hash = _load_scoring_rules(cfg)
@@ -1789,6 +1885,12 @@ def dashboard_view():
         "submitted": sum(
             1 for row in rows if row.get("display_status") == "submitted"
         ),
+        "today_submitted": sum(
+            1 for row in rows if row.get("submitted_today") == "1"
+        ),
+        "offer": sum(
+            1 for row in rows if row.get("display_status") == "offer"
+        ),
         "rejected": sum(
             1 for row in rows if row.get("display_status") == "rejected"
         ),
@@ -1802,9 +1904,11 @@ def dashboard_view():
         scoring_rules_hash=scoring_rules_hash, rule_dimensions=rule_dimensions,
         action_token=ACTION_TOKEN, statuses=USER_STATUSES,
         status_labels=USER_STATUS_LABELS,
+        availability_reason_labels=AVAILABILITY_REASON_LABELS,
         latest_run_id=latest_run_id, latest_sync_display=latest_sync_display,
         latest_sync_count=latest_sync_count,
-        show_dismissed=show_dismissed, dismissed_count=dismissed_count,
+        show_dismissed=show_dismissed, show_unavailable=show_unavailable,
+        dismissed_count=dismissed_count, unavailable_count=unavailable_count,
         freshness_priority_hours=int(
             cfg.get("application", {}).get("priority_within_hours", 24)
         ),
@@ -1882,10 +1986,14 @@ def dashboard_detail(job_id: str):
     )
     detail_statuses = USER_STATUSES + (("skipped",) if row.get("status") == "skipped" else ())
     detail_status_labels = {**USER_STATUS_LABELS, "skipped": DISMISSED_STATUS_LABEL}
+    row["unavailable_reason_label"] = AVAILABILITY_REASON_LABELS.get(
+        row.get("unavailable_reason", ""), row.get("unavailable_reason", "")
+    )
     return render_template_string(
         DASHBOARD_DETAIL_HTML, row=row, events=board.events_for(job_id),
         statuses=detail_statuses, status_labels=detail_status_labels, attempt=attempt,
         action_token=ACTION_TOKEN,
+        availability_reason_labels=AVAILABILITY_REASON_LABELS,
         platform_mode_label=PLATFORM_MODE_LABELS.get(platform_mode, platform_mode),
     )
 
@@ -1910,6 +2018,7 @@ def dashboard_transition(job_id: str):
 
         status = request.form.get("status", "")
         reason = request.form.get("reason", "").strip()
+        unavailable_reason = request.form.get("unavailable_reason", "").strip()
         evidence = request.form.get("submission_evidence", "").strip()
         submission_confirmed = "submission_confirmed" in request.form
         next_action = request.form["next_action"] if "next_action" in request.form else None
@@ -1921,16 +2030,18 @@ def dashboard_transition(job_id: str):
         current_display_status = _user_status(row.get("status", ""))
         if (
             status == "ready_to_apply"
-            and current_display_status in {"submitted", "rejected", "interview", "skipped"}
+            and current_display_status in {"submitted", "rejected", "interview", "offer", "skipped", "unavailable"}
             and not reason
         ):
-            raise ValueError("将已忽略、已提交、被拒绝或面试中的岗位改回待投递时，必须填写原因")
+            raise ValueError("将已忽略、已失效、已提交、被拒绝、面试中或有 Offer 的岗位改回待投递时，必须填写原因")
 
         default_next_actions = {
             "ready_to_apply": "继续或重新开始投递",
             "submitted": "等待雇主回复并按计划跟进",
             "rejected": "记录拒信；必要时复盘简历和匹配规则",
             "interview": "准备面试并记录安排",
+            "offer": "评估 Offer 条件并确认下一步",
+            "unavailable": "保留失效原因，不再进入投递选择",
         }
         if next_action is None:
             next_action = default_next_actions.get(status)
@@ -1943,9 +2054,26 @@ def dashboard_transition(job_id: str):
                 submission_evidence=evidence, next_action=next_action, notes=notes,
             )
         else:
+            if status == "unavailable":
+                unavailable_cancel_reason = reason or AVAILABILITY_REASON_LABELS.get(
+                    unavailable_reason, "岗位已失效"
+                )
+                active_attempt_statuses = {
+                    "selected", "queued", "browser_opened", "filling", "needs_user", "ready_to_submit",
+                }
+                for attempt in service.load_rows():
+                    if (
+                        attempt.get("job_id") == job_id
+                        and attempt.get("status") in active_attempt_statuses
+                    ):
+                        service.advance(
+                            attempt["attempt_id"], "cancelled", actor="user",
+                            reason=unavailable_cancel_reason,
+                        )
             board.transition(
                 job_id, status, actor="user", reason=reason,
                 next_action=next_action, notes=notes,
+                unavailable_reason=unavailable_reason,
             )
     except (KeyError, ValueError) as exc:
         if wants_json:
@@ -1980,7 +2108,7 @@ def dashboard_dismiss(job_id: str):
             raise KeyError(f"Dashboard 中找不到岗位: {job_id}")
         if row.get("status") == "skipped":
             raise ValueError("该岗位已经在已忽略列表中")
-        if row.get("status") in {"submitted", "follow_up", "rejected", "interview", "withdrawn"}:
+        if row.get("status") in {"submitted", "follow_up", "rejected", "interview", "offer", "withdrawn", "unavailable"}:
             raise ValueError("已进入申请历史的岗位不能标记为不想要")
 
         active_attempt_statuses = {
@@ -2029,6 +2157,42 @@ def dashboard_restore(job_id: str):
             raise ValueError("当前岗位不在已忽略列表中")
         board.transition(
             job_id, "review", actor="user", reason=RESTORE_DISMISSED_REASON,
+            next_action="Review recommendation",
+        )
+    except (KeyError, ValueError) as exc:
+        if wants_json:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        return redirect(url_for("dashboard_view", error=str(exc)))
+    service = _attempts(cfg)
+    if wants_json:
+        return jsonify(_dashboard_action_payload(
+            board, service, job_id, message="岗位已恢复到工作机会列表",
+        ))
+    if return_to_dashboard:
+        return redirect(url_for("dashboard_view", saved="1"))
+    return redirect(url_for("dashboard_detail", job_id=job_id))
+
+
+@app.route("/dashboard/<job_id>/restore-unavailable", methods=["POST"])
+def dashboard_restore_unavailable(job_id: str):
+    wants_json = "application/json" in request.headers.get("Accept", "")
+    supplied_token = request.form.get("action_token", "")
+    if not supplied_token or not hmac.compare_digest(supplied_token, ACTION_TOKEN):
+        if wants_json:
+            return jsonify({"ok": False, "error": "操作请求已失效，请刷新 Dashboard 后重试。"}), 403
+        return "操作请求已失效，请刷新 Dashboard 后重试。", 403
+
+    cfg = load_config()
+    board = _dashboard(cfg)
+    return_to_dashboard = request.form.get("return_to") == "dashboard"
+    try:
+        row = board.get(job_id)
+        if row is None:
+            raise KeyError(f"Dashboard 中找不到岗位: {job_id}")
+        if row.get("status") != "unavailable":
+            raise ValueError("当前岗位不在已失效列表中")
+        board.transition(
+            job_id, "review", actor="user", reason="用户确认岗位重新开放",
             next_action="Review recommendation",
         )
     except (KeyError, ValueError) as exc:

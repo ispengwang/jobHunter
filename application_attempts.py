@@ -7,7 +7,7 @@ daily limits, blockers, and submission evidence. The user does not operate this 
 from __future__ import annotations
 
 import csv
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 from candidate_profile import CandidateProfile
 from dashboard import Dashboard
+from schema import canonical_job_id
 
 
 ATTEMPT_STATUSES = {
@@ -33,6 +34,21 @@ ATTEMPT_FIELDS = [
 DEFAULT_ASSISTED_HOSTS = ("linkedin.com", "indeed.com", "indeed.com.au")
 DEFAULT_MANUAL_HOSTS = ("seek.com.au", "au.seek.com")
 DEFAULT_PLATFORM_LIMITS = {"linkedin": 8, "indeed": 8, "external_ats": 40}
+
+
+def _job_identity(row: dict[str, str]) -> str:
+    """Return a source-independent identity for a Dashboard/attempt row.
+
+    Older CSV rows can carry URL-based IDs.  Selection must still recognise
+    them as the same role as a newer canonical row, otherwise a second source
+    can create a second active attempt for one advertised job.
+    """
+    company = (row.get("company") or "").strip()
+    title = (row.get("title") or "").strip()
+    if company and title:
+        return canonical_job_id(company, title)
+    url = (row.get("url") or "").strip()
+    return f"url:{url}" if url else f"job:{row.get('job_id', '')}"
 
 
 def _now() -> str:
@@ -131,6 +147,36 @@ def configured_platform_limits(config: dict | None = None) -> dict[str, int]:
     return limits
 
 
+def _submission_local_date(row: dict[str, str], zone: ZoneInfo) -> date | None:
+    """Return the local calendar date for a row with evidenced submission history."""
+    if not row.get("submission_evidence", "").strip():
+        return None
+    raw = row.get("submitted_at", "").strip().replace("Z", "+00:00")
+    try:
+        submitted_at = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if submitted_at.tzinfo is None:
+        submitted_at = submitted_at.replace(tzinfo=zone)
+    return submitted_at.astimezone(zone).date()
+
+
+def submitted_today_job_ids(
+    rows: list[dict[str, str]],
+    timezone_name: str,
+    *,
+    today: date | None = None,
+) -> set[str]:
+    """Return Dashboard job IDs with evidenced submissions on the local date."""
+    zone = ZoneInfo(timezone_name)
+    target_date = today or datetime.now(zone).date()
+    return {
+        row.get("job_id", "")
+        for row in rows
+        if row.get("job_id", "") and _submission_local_date(row, zone) == target_date
+    }
+
+
 def submitted_today_by_platform(
     rows: list[dict[str, str]],
     timezone_name: str,
@@ -141,16 +187,7 @@ def submitted_today_by_platform(
     today = datetime.now(zone).date()
     counts = {key: 0 for key in configured_platform_limits(config)}
     for row in rows:
-        if row.get("status") != "submitted" or not row.get("submission_evidence", "").strip():
-            continue
-        raw = row.get("submitted_at", "").strip().replace("Z", "+00:00")
-        try:
-            submitted_at = datetime.fromisoformat(raw)
-        except ValueError:
-            continue
-        if submitted_at.tzinfo is None:
-            submitted_at = submitted_at.replace(tzinfo=zone)
-        if submitted_at.astimezone(zone).date() != today:
+        if _submission_local_date(row, zone) != today:
             continue
         key = platform_limit_key(row.get("source", ""), row.get("url", ""), config)
         counts[key] = counts.get(key, 0) + 1
@@ -215,8 +252,26 @@ class ApplicationAttempts:
             raise ValueError("config.yaml 已关闭 ApplyPilot Agent 执行")
 
         active = {"selected", "queued", "browser_opened", "filling", "needs_user", "ready_to_submit"}
+        target_identity = _job_identity(row)
+        suppressed_dashboard_statuses = {
+            "submitted", "follow_up", "rejected", "interview", "offer", "withdrawn",
+            "skipped", "unavailable", "blocked", "needs_user", "applying",
+        }
+        for sibling in self.dashboard.load_rows():
+            if (
+                sibling.get("job_id") != job_id
+                and _job_identity(sibling) == target_identity
+                and sibling.get("status") in suppressed_dashboard_statuses
+            ):
+                raise ValueError("同一公司同一岗位已有已处理或已归档记录，不能重复发起")
         for existing in self.load_rows():
-            if existing.get("job_id") == job_id and existing.get("status") in active:
+            if (
+                existing.get("status") in active
+                and (
+                    existing.get("job_id") == job_id
+                    or _job_identity(existing) == target_identity
+                )
+            ):
                 return existing
 
         if row.get("status") not in {"review", "ready_to_apply"}:
@@ -284,13 +339,52 @@ class ApplicationAttempts:
             for row in attempts
             if row.get("status") in active_statuses | terminal_statuses
         }
+        existing_identities = {
+            _job_identity(row)
+            for row in attempts
+            if row.get("status") in active_statuses | terminal_statuses
+        }
+        suppressed_dashboard_statuses = {
+            "submitted", "follow_up", "rejected", "interview", "offer", "withdrawn",
+            "skipped", "unavailable", "blocked", "needs_user", "applying",
+        }
+        suppressed_identities = {
+            _job_identity(row)
+            for row in rows
+            if row.get("status") in suppressed_dashboard_statuses
+        }
 
         candidates = [
             row for row in rows
             if row.get("status") in {"review", "ready_to_apply"}
             and row.get("application_mode") in {"broad", "targeted"}
             and row.get("job_id", "") not in existing_job_ids
+            and _job_identity(row) not in existing_identities
+            and _job_identity(row) not in suppressed_identities
         ]
+        # A legacy Dashboard can contain two rows with different IDs but the
+        # same company/title.  Keep the more actionable row in this run; the
+        # explicit migration command can later consolidate the CSV and history
+        # without making selection depend on that maintenance step.
+        unique_candidates: dict[str, dict[str, str]] = {}
+        for row in candidates:
+            identity = _job_identity(row)
+            previous = unique_candidates.get(identity)
+            if previous is None or (
+                row.get("status") == "ready_to_apply"
+                and previous.get("status") != "ready_to_apply"
+            ) or (
+                row.get("status") == previous.get("status")
+                and (
+                    _score(row.get("job_fit_score")),
+                    _score(row.get("resume_fit_score")),
+                ) > (
+                    _score(previous.get("job_fit_score")),
+                    _score(previous.get("resume_fit_score")),
+                )
+            ):
+                unique_candidates[identity] = row
+        candidates = list(unique_candidates.values())
         freshness_order = {"within_24h": 0, "within_3d": 1, "older": 2, "unknown": 3}
         current_freshness = {
             row.get("job_id", ""): self.dashboard.current_freshness(row)

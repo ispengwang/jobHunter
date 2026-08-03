@@ -3,7 +3,6 @@ search:
   terms:
   # AI 方向优先 —— 当前重点求职方向
   - AI Engineer
-  - LLM Engineer
   - AI Software Engineer
   - AI Product Engineer
   - Generative AI Engineer
@@ -13,7 +12,6 @@ search:
   - Associate Software Engineer
   - Entry Level Software Engineer
   - Graduate Developer
-  # web/全栈基础盘,兜住 AI 方向没覆盖到的岗位
   - Junior Full Stack Developer
   - Frontend Developer React
   - Graduate Software Engineer
@@ -37,7 +35,10 @@ seek:
   # SEEK 岗位分类：6281 = Information & Communication Technology
   classification: "6281"
   # SEEK 的地区 slug
-  location_slug: "All-Melbourne-VIC"
+  # 2026-07-30 由用户确认放宽到整个维州：单一 slug，请求量不随地区数翻倍，
+  # 但会带进 Ballarat / Bendigo / Geelong 等远途岗位，打分量随之上升。
+  # 想收回墨尔本都会区就改回 "All-Melbourne-VIC"。
+  location_slug: "All-Victoria-VIC"
   # 多地区时用列表；一旦启用会覆盖上面的 location_slug。默认保持单地区，
   # 不要在没有确认通勤上限前自行放宽。候选值：
   # All-Victoria-VIC / West-Gippsland-and-Latrobe-Valley-VIC /
@@ -123,7 +124,8 @@ application:
   recent_within_hours: 72
   # 只有 entry/new grad/junior 默认进入自动准备队列，其他级别留给人工审核。
   eligible_seniority_keywords: [graduate, new grad, entry, junior, jnr]
-  excluded_seniority_keywords: [senior, staff, principal, lead, manager, director]
+  excluded_seniority_keywords: [senior, staff, principal, lead, manager,
+      director]
   # 标题没有级别信号时，JD 要求超过此年限才转人工复核。
   max_years_experience: 2
   # 多份简历时 job-fit 与 resume-fit 都达到 targeted 阈值才走精投；单份简历只看 job-fit。
