@@ -5,19 +5,21 @@ resumes:
     path: profile/resume.md
     label: Default resume
     target_roles:
-      - AI Engineer
-      - LLM Engineer
-      - AI Software Engineer
-      - AI Product Engineer
-      - Generative AI Engineer
       - Full Stack Developer
+      - Full Stack Engineer
+      - Full Stack Software Engineer
+      - Software Engineer
       - Frontend Developer
       - Graduate Software Engineer
+      - AI Software Engineer
+      - AI Engineer
+      - AI Product Engineer
+      - Generative AI Engineer
     keywords:
-      - AI
-      - LLM
       - React
       - TypeScript
       - Node.js
       - full-stack
+      - AI
+      - LLM
     seniority: [graduate, entry, junior]

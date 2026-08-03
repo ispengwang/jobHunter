@@ -1,20 +1,22 @@
 search:
   # 搜索词，逐个跑，结果合并去重
   terms:
-  # AI 方向优先 —— 当前重点求职方向
-  - AI Engineer
-  - AI Software Engineer
-  - AI Product Engineer
-  - Generative AI Engineer
-  - Full Stack Developer AI
-  - Graduate AI Engineer
-  - Junior AI Engineer
-  - Associate Software Engineer
-  - Entry Level Software Engineer
-  - Graduate Developer
+  # 全栈开发优先 —— 当前重点求职方向
+  - Full Stack Developer
+  - Full Stack Engineer
+  - Full Stack Software Engineer
   - Junior Full Stack Developer
   - Frontend Developer React
+  - Associate Software Engineer
+  - Entry Level Software Engineer
   - Graduate Software Engineer
+  - Graduate Developer
+  # AI / LLM 应用工程作为次级方向，保留与全栈背景相邻的机会
+  - Full Stack Developer AI
+  - AI Software Engineer
+  - AI Engineer
+  - AI Product Engineer
+  - Generative AI Engineer
   location: "Melbourne VIC"   # 改成 Sydney NSW / Brisbane QLD 等
   country: "australia"
   results_per_term: 50

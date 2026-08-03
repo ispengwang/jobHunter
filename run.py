@@ -130,8 +130,9 @@ def _posted_sort_value(job: Job) -> float:
 def representative_sample(jobs: list[Job], limit: int | None) -> list[Job]:
     """Take a fresh, representative sample after dedupe instead of fetch-order rows.
 
-    A junior slice is reserved because junior terms are intentionally later in the configured
-    search list. The rest is newest-first; ties retain the original deterministic order.
+    A junior slice is reserved so a small limit remains representative even when the newest
+    results are senior or have no explicit level signal. The rest is newest-first; ties retain
+    the original deterministic order.
     """
     if not limit or limit >= len(jobs):
         return list(jobs)
