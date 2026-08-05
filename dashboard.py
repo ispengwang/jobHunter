@@ -13,7 +13,8 @@ from schema import Job
 
 STATUSES = {
     "new", "review", "ready_to_apply", "applying", "needs_user", "submitted",
-    "follow_up", "skipped", "unavailable", "blocked", "interview", "offer", "rejected", "withdrawn",
+    "follow_up", "skipped", "unavailable", "blocked", "interview",
+    "phone_interview", "formal_interview", "offer", "rejected", "withdrawn",
 }
 REASON_REQUIRED = {"skipped", "unavailable", "blocked", "needs_user"}
 AVAILABILITY_REASON_LABELS = {

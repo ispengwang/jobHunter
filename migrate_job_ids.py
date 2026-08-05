@@ -31,11 +31,14 @@ STATUS_PRIORITY = {
     "unavailable": 2,
     "applying": 2,
     "interview": 3,
+    "phone_interview": 3,
+    "formal_interview": 3,
     "follow_up": 3,
     "rejected": 4,
     "withdrawn": 4,
     "skipped": 5,
     "submitted": 6,
+    "offer": 7,
 }
 CSV_NAMES = (
     "application-dashboard.csv",

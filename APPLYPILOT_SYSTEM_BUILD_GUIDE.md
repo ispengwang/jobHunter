@@ -188,11 +188,12 @@ output/
 ```text
 new → review → ready_to_apply → applying → submitted → follow_up
        │             │             │           │
-       ├→ skipped    ├→ unavailable  └→ needs_user / blocked  └→ rejected / interview / offer / withdrawn
+       ├→ skipped    ├→ unavailable  └→ needs_user / blocked  └→ rejected / phone_interview / formal_interview / offer / withdrawn
 ```
 
 主 Dashboard 将这些详细执行状态投影成用户状态：`ready_to_apply`（待投递）、
-`submitted`（已提交）、`offer`（有 Offer）、`rejected`（被拒绝）、`interview`（面试中）。内部的
+`submitted`（已提交）、`rejected`（被拒绝）、`phone_interview`（电话面试）、
+`formal_interview`（正式面试）、`offer`（有 Offer）。历史记录中的 `interview` 在界面上兼容显示为正式面试。内部的
 `review`、`applying`、`needs_user`、`blocked` 等状态和原因继续保留用于审计，
 不会因为界面精简而删除。
 
@@ -204,6 +205,8 @@ new → review → ready_to_apply → applying → submitted → follow_up
 | `ready_to_apply` | 待投递 | 通过筛选，材料已准备并经人工检查 |
 | `needs_user` | 需要你处理 | 缺资料、验证、未知问题或其他必须由用户完成的动作 |
 | `submitted` | 已提交 | ApplyPilot 有明确成功证据，或用户在已确认外部平台成功后通过 Dashboard 一键确认 |
+| `phone_interview` | 电话面试 | 用户确认进入电话或初筛沟通后手动记录 |
+| `formal_interview` | 正式面试 | 用户确认进入正式面试流程后手动记录 |
 | `offer` | 有 Offer | 用户确认收到 Offer 后手动记录；事件日志保留变更时间和备注 |
 | `skipped` | 已跳过 | 明确决定不投，必须填写原因 |
 | `unavailable` | 岗位已失效 | 招聘方已过期、停止招聘、链接失效或已招满；必须选择失效原因，不计入用户“已忽略” |

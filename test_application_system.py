@@ -616,9 +616,53 @@ try:
     app_cfg_path.write_text(yaml.safe_dump(app_cfg, sort_keys=False), encoding="utf-8")
     import webapp
     old_config_path = webapp.CONFIG_PATH
+    old_prefs_path = webapp.PREFS_PATH
     webapp.CONFIG_PATH = app_cfg_path
+    webapp.PREFS_PATH = profile_dir / "preferences.md"
     try:
         client = webapp.app.test_client()
+        settings_html = client.get("/").get_data(as_text=True)
+        check("设置页显示自动搜索任务", "自动搜索任务" in settings_html)
+        check("设置页显示增量间隔控件", 'name="schedule_incremental_interval_minutes"' in settings_html)
+        check("设置页提供 macOS 定时任务应用按钮", "保存并应用到 macOS 定时任务" in settings_html)
+        saved_schedule = client.post("/save", data={
+            "terms": "Junior Developer",
+            "location": "Melbourne VIC",
+            "hours_old": "168",
+            "src_linkedin": "on",
+            "src_indeed": "on",
+            "src_seek": "on",
+            "exclude_keywords": "",
+            "bonus_keywords": "",
+            "provider": "deepseek",
+            "threshold": "75",
+            "preferences": "Junior roles",
+            "schedule_incremental_enabled": "on",
+            "schedule_incremental_interval_minutes": "60",
+            "schedule_full_time": "03:30",
+        })
+        saved_schedule_cfg = yaml.safe_load(app_cfg_path.read_text(encoding="utf-8"))
+        check("设置页保存自动搜索配置", saved_schedule.status_code, 302)
+        check(
+            "增量任务开关可保存",
+            saved_schedule_cfg["scheduled_search"]["incremental_enabled"],
+            True,
+        )
+        check(
+            "增量间隔可保存",
+            saved_schedule_cfg["scheduled_search"]["incremental_interval_minutes"],
+            60,
+        )
+        check(
+            "关闭全量任务可保存",
+            saved_schedule_cfg["scheduled_search"]["full_enabled"],
+            False,
+        )
+        check(
+            "全量时间可保存",
+            saved_schedule_cfg["scheduled_search"]["full_time"],
+            "03:30",
+        )
         dismiss_job = Job(
             "seek", "Junior Not Interested", "DismissCo", "https://example.test/jobs/dismiss",
             posted_date=job.posted_date, description="Junior product engineering role.",
@@ -735,9 +779,20 @@ try:
         check("Dashboard 状态筛选包含用户状态", all(
             token in dashboard_html for token in [
                 'data-v="ready_to_apply"', 'data-v="submitted"',
-                'data-v="rejected"', 'data-v="interview"', 'data-v="offer"',
+                'data-v="rejected"', 'data-v="phone_interview"',
+                'data-v="formal_interview"', 'data-v="offer"',
             ]
         ))
+        check("Dashboard 顶部统计卡片全部可点击", dashboard_html.count('data-stat-key='), 9)
+        check("Dashboard 顶部统计卡片联动筛选", "applyStatFilter(" in dashboard_html)
+        check("Dashboard 显示电话面试统计", 'id="stat-phone-interview"' in dashboard_html)
+        check("Dashboard 显示正式面试统计", 'id="stat-formal-interview"' in dashboard_html)
+        check(
+            "Dashboard 将有 Offer 放在顶部统计最后",
+            dashboard_html.index('data-stat-key="offer"')
+            > dashboard_html.index('data-stat-key="formal_interview"'),
+        )
+        check("旧 interview 状态映射为正式面试", webapp._user_status("interview"), "formal_interview")
         check("Dashboard 默认状态筛选为待投递", "status: 'ready_to_apply'" in dashboard_html)
         check("Dashboard 重置筛选回到待投递", "state.status='ready_to_apply'" in dashboard_html)
         check("Dashboard 不再显示内部状态筛选", all(
@@ -892,25 +947,43 @@ try:
         )
         confirmed_attempt = webapp._attempts(webapp.load_config()).get(manual_payload["attempt_id"])
         check("确认提交同步内部 attempt", confirmed_attempt["status"], "submitted")
-        converted_status = client.post(
+        phone_interview_status = client.post(
             f"/dashboard/{linked_in.id}/transition",
             data={
                 "action_token": webapp.ACTION_TOKEN,
                 "return_to": "dashboard",
-                "status": "interview",
-                "reason": "收到第一轮面试邀请",
+                "status": "phone_interview",
+                "reason": "收到电话面试邀请",
             },
             headers={"Accept": "application/json"},
         )
-        converted_payload = converted_status.get_json()
-        check("用户可局部转换申请状态", converted_status.status_code, 200)
-        check("状态转换返回局部更新数据", converted_payload["display_status"], "interview")
-        converted_row = webapp._dashboard(webapp.load_config()).get(linked_in.id)
-        check("状态转换写入面试中", converted_row["status"], "interview")
+        phone_interview_payload = phone_interview_status.get_json()
+        check("用户可局部转换为电话面试", phone_interview_status.status_code, 200)
+        check("电话面试返回局部更新数据", phone_interview_payload["display_status"], "phone_interview")
+        phone_interview_row = webapp._dashboard(webapp.load_config()).get(linked_in.id)
+        check("状态转换写入电话面试", phone_interview_row["status"], "phone_interview")
         check(
             "状态转换保留提交证据",
-            converted_row["submission_evidence"],
+            phone_interview_row["submission_evidence"],
             webapp.USER_CONFIRMED_SUBMISSION_EVIDENCE,
+        )
+        formal_interview_status = client.post(
+            f"/dashboard/{linked_in.id}/transition",
+            data={
+                "action_token": webapp.ACTION_TOKEN,
+                "return_to": "dashboard",
+                "status": "formal_interview",
+                "reason": "进入正式面试",
+            },
+            headers={"Accept": "application/json"},
+        )
+        formal_interview_payload = formal_interview_status.get_json()
+        check("用户可局部转换为正式面试", formal_interview_status.status_code, 200)
+        check("正式面试返回局部更新数据", formal_interview_payload["display_status"], "formal_interview")
+        check(
+            "状态转换写入正式面试",
+            webapp._dashboard(webapp.load_config()).get(linked_in.id)["status"],
+            "formal_interview",
         )
         offer_status = client.post(
             f"/dashboard/{linked_in.id}/transition",
@@ -951,6 +1024,7 @@ try:
         )
     finally:
         webapp.CONFIG_PATH = old_config_path
+        webapp.PREFS_PATH = old_prefs_path
 finally:
     shutil.rmtree(tmp)
 

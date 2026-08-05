@@ -51,6 +51,11 @@ from application_attempts import (
 )
 from application_policy import freshness_bucket
 from scrapers.seek_source import clean_seek_title
+from scheduler import (
+    DEFAULT_SCHEDULED_SEARCH,
+    apply_launchd_schedule,
+    normalise_scheduled_search,
+)
 
 ROOT = Path(__file__).parent
 CONFIG_PATH = ROOT / "config.yaml"
@@ -128,16 +133,21 @@ STATUS_LABELS = {
     "new": "新发现", "review": "待审核", "ready_to_apply": "待投递",
     "applying": "投递中", "needs_user": "需要你处理", "submitted": "已提交",
     "follow_up": "待跟进",
-    "skipped": "已跳过", "unavailable": "岗位已失效", "blocked": "已卡住", "interview": "面试中",
+    "skipped": "已跳过", "unavailable": "岗位已失效", "blocked": "已卡住",
+    "interview": "正式面试", "phone_interview": "电话面试", "formal_interview": "正式面试",
     "offer": "有 Offer",
     "rejected": "已拒绝", "withdrawn": "已撤回",
 }
-USER_STATUSES = ("ready_to_apply", "submitted", "rejected", "interview", "offer", "unavailable")
+USER_STATUSES = (
+    "ready_to_apply", "submitted", "rejected", "phone_interview",
+    "formal_interview", "offer", "unavailable",
+)
 USER_STATUS_LABELS = {
     "ready_to_apply": "待投递",
     "submitted": "已提交",
     "rejected": "被拒绝",
-    "interview": "面试中",
+    "phone_interview": "电话面试",
+    "formal_interview": "正式面试",
     "offer": "有 Offer",
     "unavailable": "岗位已失效",
 }
@@ -164,7 +174,12 @@ USER_CONFIRMED_SUBMISSION_EVIDENCE = "用户确认：外部平台已成功提交
 
 def _user_status(status: str) -> str:
     """Project internal execution states onto the user-facing status labels."""
-    return status if status in {"submitted", "rejected", "interview", "offer", "skipped", "unavailable"} else "ready_to_apply"
+    if status == "interview":
+        return "formal_interview"
+    return status if status in {
+        "submitted", "rejected", "phone_interview", "formal_interview",
+        "offer", "skipped", "unavailable",
+    } else "ready_to_apply"
 
 
 def _latest_active_attempt(service: ApplicationAttempts, job_id: str) -> dict[str, str] | None:
@@ -656,6 +671,7 @@ BASE_STYLE = """
   .btn[disabled] { opacity: .4; cursor: not-allowed; }
   .flash { background: var(--success-bg); border: 1px solid var(--success-border); color: var(--success-text);
            border-radius: var(--radius); padding: 10px 14px; font-size: 13px; margin: 4px 0 18px; }
+  .flash.error { background: var(--danger-bg); border-color: var(--danger-border); color: var(--danger-text); }
   .pill { display: inline-flex; align-items: center; border: 1px solid var(--accent-border);
           border-radius: 100px; padding: 2px 8px; font-size: 11px;
           background: var(--accent-soft); color: var(--accent); }
@@ -703,6 +719,8 @@ INDEX_HTML = """
 <p class="sub">改设置、一键跑抓取和打分,不用回终端。</p>
 
 {% if saved %}<div class="flash">已保存到 config.yaml 和 profile/preferences.md。</div>{% endif %}
+{% if schedule_applied %}<div class="flash">自动搜索设置已保存，并已更新 macOS 定时任务。</div>{% endif %}
+{% if schedule_error %}<div class="flash error">{{ schedule_error }}</div>{% endif %}
 
 <form method="post" action="/save">
 
@@ -726,6 +744,24 @@ INDEX_HTML = """
       <label><input type="checkbox" name="src_indeed" {{ 'checked' if cfg.sources.indeed }}>Indeed</label>
       <label><input type="checkbox" name="src_seek" {{ 'checked' if cfg.sources.seek }}>SEEK</label>
     </div>
+  </div>
+
+  <div class="card">
+    <h2>自动搜索任务</h2>
+    <p class="hint">保存设置只更新本地计划；需要实际更新 macOS launchd 时，请使用下方的“保存并应用”按钮。增量任务默认使用 <code>--incremental</code>，全量任务每天运行一次。</p>
+    <div class="checks">
+      <label><input type="checkbox" name="schedule_incremental_enabled" {{ 'checked' if schedule.incremental_enabled }}>启用增量搜索</label>
+      <label><input type="checkbox" name="schedule_full_enabled" {{ 'checked' if schedule.full_enabled }}>启用每日全量搜索</label>
+    </div>
+    <div class="row cols-2">
+      <div><label>增量搜索间隔（分钟，30–1440）</label>
+        <input type="number" name="schedule_incremental_interval_minutes" min="30" max="1440" step="30" value="{{ schedule.incremental_interval_minutes }}">
+      </div>
+      <div><label>每日全量搜索时间（本机时间）</label>
+        <input type="time" name="schedule_full_time" value="{{ schedule.full_time }}">
+      </div>
+    </div>
+    <p class="hint">建议保留至少 30 分钟间隔，避免对岗位来源请求过于频繁。两个任务都关闭时，应用后会停用现有 JobHunter 定时任务。</p>
   </div>
 
   <div class="card">
@@ -759,6 +795,7 @@ INDEX_HTML = """
   </div>
 
   <button type="submit" class="btn primary">保存设置</button>
+  <button type="submit" name="apply_schedule" value="1" class="btn">保存并应用到 macOS 定时任务</button>
 </form>
 
 <div class="card">
@@ -1116,10 +1153,16 @@ DASHBOARD_HTML = """
 <html lang="zh"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Dashboard · jobhunt-au</title><style>""" + BASE_STYLE + """
-  .stats { display:grid; grid-template-columns:repeat(8,1fr); gap:8px; margin:4px 0 16px; }
-  .stat { min-width:0; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:10px 12px; }
-  .stat .n { font-size:20px; font-weight:600; line-height:1.2; }
-  .stat .k { color:var(--text-dim); font-size:11.5px; margin-top:2px; white-space:nowrap; }
+  .stats { display:grid; grid-template-columns:repeat(9,1fr); gap:8px; margin:4px 0 16px; }
+  .stat { min-width:0; width:100%; appearance:none; text-align:left; color:inherit; font:inherit;
+          background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+          padding:10px 12px; cursor:pointer; transition:border-color .15s,background .15s,transform .05s; }
+  .stat:hover { border-color:var(--accent-border); background:var(--accent-soft); }
+  .stat:active { transform:scale(.98); }
+  .stat:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  .stat.on { border-color:var(--accent); background:var(--accent-soft); box-shadow:inset 0 0 0 1px var(--accent); }
+  .stat .n { display:block; font-size:20px; font-weight:600; line-height:1.2; }
+  .stat .k { display:block; color:var(--text-dim); font-size:11.5px; margin-top:2px; white-space:nowrap; }
   .stat.high .n { color:var(--success-text); }.stat.mid .n { color:var(--warn-text); }.stat.danger .n { color:var(--danger-text); }
   .today-banner { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:4px 0 16px; padding:12px 14px; border:1px solid var(--accent-border); border-radius:var(--radius-lg); background:var(--accent-soft); }
   .today-banner strong { display:block; font-size:13px; color:var(--accent); }.today-banner span { color:var(--text-dim); font-size:12px; }
@@ -1191,14 +1234,15 @@ DASHBOARD_HTML = """
 {% if saved %}<div class="flash">状态已更新，并已写入操作事件。</div>{% endif %}
 {% if error %}<div class="card"><h2>无法更新状态</h2><p class="hint">{{ error }}</p></div>{% endif %}
 <div class="stats">
-  <div class="stat"><div class="n" id="stat-total">{{ stats.total }}</div><div class="k">全部机会</div></div>
-  <div class="stat high"><div class="n" id="stat-within-24h">{{ stats.within_24h }}</div><div class="k">24h 内发布</div></div>
-  <div class="stat"><div class="n" id="stat-ready-to-apply">{{ stats.ready_to_apply }}</div><div class="k">待投递</div></div>
-  <div class="stat high"><div class="n" id="stat-submitted">{{ stats.submitted }}</div><div class="k">累计已提交</div></div>
-  <div class="stat high"><div class="n" id="stat-today-submitted">{{ stats.today_submitted }}</div><div class="k">今日提交</div></div>
-  <div class="stat mid"><div class="n" id="stat-offer">{{ stats.offer }}</div><div class="k">有 Offer</div></div>
-  <div class="stat danger"><div class="n" id="stat-rejected">{{ stats.rejected }}</div><div class="k">被拒绝</div></div>
-  <div class="stat mid"><div class="n" id="stat-interview">{{ stats.interview }}</div><div class="k">面试中</div></div>
+  <button type="button" class="stat" data-stat-key="all" onclick="applyStatFilter('all','all',this)"><span class="n" id="stat-total">{{ stats.total }}</span><span class="k">全部机会</span></button>
+  <button type="button" class="stat high" data-stat-key="within_24h" onclick="applyStatFilter('freshness','within_24h',this)"><span class="n" id="stat-within-24h">{{ stats.within_24h }}</span><span class="k">24h 内发布</span></button>
+  <button type="button" class="stat on" data-stat-key="ready_to_apply" onclick="applyStatFilter('status','ready_to_apply',this)"><span class="n" id="stat-ready-to-apply">{{ stats.ready_to_apply }}</span><span class="k">待投递</span></button>
+  <button type="button" class="stat high" data-stat-key="submitted" onclick="applyStatFilter('status','submitted',this)"><span class="n" id="stat-submitted">{{ stats.submitted }}</span><span class="k">累计已提交</span></button>
+  <button type="button" class="stat high" data-stat-key="today_submitted" onclick="applyStatFilter('queue','submitted_today',this)"><span class="n" id="stat-today-submitted">{{ stats.today_submitted }}</span><span class="k">今日提交</span></button>
+  <button type="button" class="stat danger" data-stat-key="rejected" onclick="applyStatFilter('status','rejected',this)"><span class="n" id="stat-rejected">{{ stats.rejected }}</span><span class="k">被拒绝</span></button>
+  <button type="button" class="stat mid" data-stat-key="phone_interview" onclick="applyStatFilter('status','phone_interview',this)"><span class="n" id="stat-phone-interview">{{ stats.phone_interview }}</span><span class="k">电话面试</span></button>
+  <button type="button" class="stat mid" data-stat-key="formal_interview" onclick="applyStatFilter('status','formal_interview',this)"><span class="n" id="stat-formal-interview">{{ stats.formal_interview }}</span><span class="k">正式面试</span></button>
+  <button type="button" class="stat mid" data-stat-key="offer" onclick="applyStatFilter('status','offer',this)"><span class="n" id="stat-offer">{{ stats.offer }}</span><span class="k">有 Offer</span></button>
 </div>
 
 <div class="today-banner">
@@ -1226,16 +1270,16 @@ DASHBOARD_HTML = """
     <label>搜索 <input type="text" id="q" placeholder="公司 / 职位 / 匹配理由" oninput="filterRows(true)"></label>
   </div>
   <div class="filter-row">
-    <label>视图 <span class="seg"><button class="on" data-v="all" onclick="setQueue('all', this)">全部</button><button data-v="latest" onclick="setQueue('latest', this)">最近同步</button><button data-v="today" onclick="setQueue('today', this)">今日行动（待处理）</button><button data-v="submitted_today" onclick="setQueue('submitted_today', this)">今日提交</button><button data-v="history" onclick="setQueue('history', this)">历史</button></span></label>
-    <label>状态 <span class="seg"><button data-v="all" onclick="setSeg('status', 'all', this)">全部</button><button class="on" data-v="ready_to_apply" onclick="setSeg('status', 'ready_to_apply', this)">待投递</button><button data-v="submitted" onclick="setSeg('status', 'submitted', this)">已提交</button><button data-v="offer" onclick="setSeg('status', 'offer', this)">有 Offer</button><button data-v="rejected" onclick="setSeg('status', 'rejected', this)">被拒绝</button><button data-v="interview" onclick="setSeg('status', 'interview', this)">面试中</button>{% if show_unavailable %}<button data-v="unavailable" onclick="setSeg('status', 'unavailable', this)">岗位已失效</button>{% endif %}</span></label>
+    <label>视图 <span class="seg" data-filter-group="queue"><button class="on" data-v="all" onclick="setQueue('all', this)">全部</button><button data-v="latest" onclick="setQueue('latest', this)">最近同步</button><button data-v="today" onclick="setQueue('today', this)">今日行动（待处理）</button><button data-v="submitted_today" onclick="setQueue('submitted_today', this)">今日提交</button><button data-v="history" onclick="setQueue('history', this)">历史</button></span></label>
+    <label>状态 <span class="seg" data-filter-group="status"><button data-v="all" onclick="setSeg('status', 'all', this)">全部</button><button class="on" data-v="ready_to_apply" onclick="setSeg('status', 'ready_to_apply', this)">待投递</button><button data-v="submitted" onclick="setSeg('status', 'submitted', this)">已提交</button><button data-v="rejected" onclick="setSeg('status', 'rejected', this)">被拒绝</button><button data-v="phone_interview" onclick="setSeg('status', 'phone_interview', this)">电话面试</button><button data-v="formal_interview" onclick="setSeg('status', 'formal_interview', this)">正式面试</button><button data-v="offer" onclick="setSeg('status', 'offer', this)">有 Offer</button>{% if show_unavailable %}<button data-v="unavailable" onclick="setSeg('status', 'unavailable', this)">岗位已失效</button>{% endif %}</span></label>
   </div>
   <div class="filter-row">
-    <label>担保 <span class="seg"><button class="on" data-v="all" onclick="setSeg('sponsor', 'all', this)">全部</button><button data-v="explicit_yes" onclick="setSeg('sponsor', 'explicit_yes', this)">可担保</button><button data-v="unknown" onclick="setSeg('sponsor', 'unknown', this)">未提及</button><button data-v="explicit_no" onclick="setSeg('sponsor', 'explicit_no', this)">不担保</button></span></label>
+    <label>担保 <span class="seg" data-filter-group="sponsor"><button class="on" data-v="all" onclick="setSeg('sponsor', 'all', this)">全部</button><button data-v="explicit_yes" onclick="setSeg('sponsor', 'explicit_yes', this)">可担保</button><button data-v="unknown" onclick="setSeg('sponsor', 'unknown', this)">未提及</button><button data-v="explicit_no" onclick="setSeg('sponsor', 'explicit_no', this)">不担保</button></span></label>
     <span class="count" id="count"></span>
   </div>
   <div class="filter-row">
-    <label>来源 <span class="seg"><button class="on" data-v="all" onclick="setSeg('source', 'all', this)">全部</button>{% for s in sources %}<button data-v="{{ s }}" onclick="setSeg('source', '{{ s }}', this)">{{ s }}</button>{% endfor %}</span></label>
-    <label>新鲜度 <span class="seg"><button class="on" data-v="all" onclick="setSeg('freshness', 'all', this)">全部</button><button data-v="within_24h" onclick="setSeg('freshness', 'within_24h', this)">24 小时</button><button data-v="within_3d" onclick="setSeg('freshness', 'within_3d', this)">3 天</button></span></label>
+    <label>来源 <span class="seg" data-filter-group="source"><button class="on" data-v="all" onclick="setSeg('source', 'all', this)">全部</button>{% for s in sources %}<button data-v="{{ s }}" onclick="setSeg('source', '{{ s }}', this)">{{ s }}</button>{% endfor %}</span></label>
+    <label>新鲜度 <span class="seg" data-filter-group="freshness"><button class="on" data-v="all" onclick="setSeg('freshness', 'all', this)">全部</button><button data-v="within_24h" onclick="setSeg('freshness', 'within_24h', this)">24 小时</button><button data-v="within_3d" onclick="setSeg('freshness', 'within_3d', this)">3 天</button></span></label>
     <button class="btn-reset" onclick="resetFilters()">重置筛选</button>
   </div>
 </div>
@@ -1275,7 +1319,7 @@ DASHBOARD_HTML = """
       <button class="btn primary" type="submit">恢复到工作机会</button>
     </form>
     {% else %}
-    {% if r.status not in ['submitted', 'follow_up', 'rejected', 'interview', 'offer', 'withdrawn'] %}
+    {% if r.status not in ['submitted', 'follow_up', 'rejected', 'interview', 'phone_interview', 'formal_interview', 'offer', 'withdrawn'] %}
     <form method="post" action="{{ url_for('dashboard_dismiss', job_id=r.job_id) }}" data-not-interested onsubmit="return dismissJob(event, this)">
       <input type="hidden" name="action_token" value="{{ action_token }}">
       <input type="hidden" name="return_to" value="dashboard">
@@ -1378,9 +1422,13 @@ let visibleLimit = pageSize;
 let statusTrigger = null;
 function syncRange(){document.getElementById('min-score').value=document.getElementById('min-range').value;filterRows(true);}
 function syncNumber(){let v=parseInt(document.getElementById('min-score').value||'-1',10);v=Math.max(-1,Math.min(100,isNaN(v)?-1:v));document.getElementById('min-range').value=v;filterRows(true);}
-function setQueue(value, btn){state.queue=value;document.querySelectorAll('.filters .seg').forEach(seg=>{if(seg.querySelector('[onclick^="setQueue"]'))seg.querySelectorAll('button').forEach(b=>b.classList.toggle('on',b.dataset.v===value));});if(btn&&btn.parentNode&&btn.parentNode.classList.contains('seg'))btn.parentNode.querySelectorAll('button').forEach(b=>b.classList.toggle('on',b.dataset.v===value));filterRows(true);}
-function setSeg(group,value,btn){if(!btn)return;state[group]=value;btn.parentNode.querySelectorAll('button').forEach(b=>b.classList.remove('on'));btn.classList.add('on');filterRows(true);}
-function resetFilters(){document.getElementById('min-score').value=-1;document.getElementById('min-range').value=-1;document.getElementById('q').value='';state.queue='all';state.status='ready_to_apply';state.sponsor='all';state.source='all';state.freshness='all';document.querySelectorAll('.seg').forEach(seg=>{const desired=seg.querySelector('[data-v="ready_to_apply"]')?'ready_to_apply':'all';seg.querySelectorAll('button').forEach(b=>b.classList.toggle('on',b.dataset.v===desired));});filterRows(true);}
+function syncFilterControls(){document.querySelectorAll('.seg[data-filter-group]').forEach(seg=>{const group=seg.dataset.filterGroup;seg.querySelectorAll('button').forEach(b=>b.classList.toggle('on',b.dataset.v===state[group]));});}
+function setActiveStat(key){document.querySelectorAll('.stat[data-stat-key]').forEach(stat=>stat.classList.toggle('on',stat.dataset.statKey===key));}
+function clearActiveStat(){document.querySelectorAll('.stat[data-stat-key]').forEach(stat=>stat.classList.remove('on'));}
+function setQueue(value, btn){state.queue=value;syncFilterControls();clearActiveStat();filterRows(true);}
+function setSeg(group,value,btn){state[group]=value;syncFilterControls();clearActiveStat();filterRows(true);}
+function applyStatFilter(group,value,btn){document.getElementById('min-score').value=-1;document.getElementById('min-range').value=-1;document.getElementById('q').value='';state.queue='all';state.status='all';state.sponsor='all';state.source='all';state.freshness='all';if(group!=='all')state[group]=value;syncFilterControls();setActiveStat(btn.dataset.statKey);filterRows(true);}
+function resetFilters(){document.getElementById('min-score').value=-1;document.getElementById('min-range').value=-1;document.getElementById('q').value='';state.queue='all';state.status='ready_to_apply';state.sponsor='all';state.source='all';state.freshness='all';syncFilterControls();setActiveStat('ready_to_apply');filterRows(true);}
 function filterRows(resetLimit=false){
   if(resetLimit)visibleLimit=pageSize;
   const min=parseInt(document.getElementById('min-score').value||'-1',10);
@@ -1447,7 +1495,7 @@ function openStatusDialog(button){
   select.value=button.dataset.current;
   document.getElementById('status-choice').hidden=false;
   document.getElementById('status-dialog-title').textContent='转换申请状态';
-  document.getElementById('status-dialog-hint').textContent='可在待投递、已提交、面试中、有 Offer 和其他状态之间转换；变化会写入历史记录。';
+  document.getElementById('status-dialog-hint').textContent='可在待投递、已提交、电话面试、正式面试和有 Offer 等状态之间转换；变化会写入历史记录。';
   document.getElementById('status-save').textContent='保存新状态';
   document.getElementById('status-dialog-error').hidden=true;
   document.getElementById('status-dialog-error').textContent='';
@@ -1489,12 +1537,12 @@ function updateStatusDialog(){
   const same=modal.dataset.mode==='change'&&select.value===modal.dataset.current;
   document.getElementById('same-status').hidden=!same;
   const reason=document.getElementById('status-reason');
-  const returning=select.value==='ready_to_apply'&&['submitted','rejected','interview','offer','skipped','unavailable'].includes(modal.dataset.current);
+  const returning=select.value==='ready_to_apply'&&['submitted','rejected','phone_interview','formal_interview','offer','skipped','unavailable'].includes(modal.dataset.current);
   reason.required=returning;
   reason.placeholder=unavailable?'可补充看到的页面提示（可选）':returning?'请说明为什么重新进入待投递':'例如：收到面试邀请';
   document.getElementById('status-save').disabled=same;
 }
-const statusStatIds={total:'stat-total',within_24h:'stat-within-24h',ready_to_apply:'stat-ready-to-apply',submitted:'stat-submitted',today_submitted:'stat-today-submitted',offer:'stat-offer',rejected:'stat-rejected',interview:'stat-interview'};
+const statusStatIds={total:'stat-total',within_24h:'stat-within-24h',ready_to_apply:'stat-ready-to-apply',submitted:'stat-submitted',today_submitted:'stat-today-submitted',rejected:'stat-rejected',phone_interview:'stat-phone-interview',formal_interview:'stat-formal-interview',offer:'stat-offer'};
 function changeStat(status,delta){
   const target=document.getElementById(statusStatIds[status]);
   if(!target)return;
@@ -1765,6 +1813,13 @@ def index():
     exclude_keywords = "\n".join(cfg["visa"]["exclude_keywords"])
     bonus_keywords = "\n".join(cfg["visa"]["bonus_keywords"])
     preferences = PREFS_PATH.read_text(encoding="utf-8") if PREFS_PATH.exists() else ""
+    raw_schedule = cfg.get("scheduled_search", {})
+    try:
+        schedule = normalise_scheduled_search(raw_schedule)
+        schedule_error = ""
+    except ValueError as exc:
+        schedule = dict(DEFAULT_SCHEDULED_SEARCH)
+        schedule_error = f"自动搜索设置需要修正：{exc}"
     with RUN_LOCK:
         log_text = "\n".join(RUN_STATE["log"]) or "(还没跑过)"
         run_state = dict(RUN_STATE)
@@ -1772,6 +1827,8 @@ def index():
         INDEX_HTML, cfg=cfg, terms=terms, exclude_keywords=exclude_keywords,
         bonus_keywords=bonus_keywords, preferences=preferences,
         saved=request.args.get("saved") == "1",
+        schedule=schedule, schedule_applied=request.args.get("schedule_applied") == "1",
+        schedule_error=request.args.get("schedule_error") or schedule_error,
         log_text=log_text, run_state=run_state,
     )
 
@@ -1888,14 +1945,17 @@ def dashboard_view():
         "today_submitted": sum(
             1 for row in rows if row.get("submitted_today") == "1"
         ),
-        "offer": sum(
-            1 for row in rows if row.get("display_status") == "offer"
-        ),
         "rejected": sum(
             1 for row in rows if row.get("display_status") == "rejected"
         ),
-        "interview": sum(
-            1 for row in rows if row.get("display_status") == "interview"
+        "phone_interview": sum(
+            1 for row in rows if row.get("display_status") == "phone_interview"
+        ),
+        "formal_interview": sum(
+            1 for row in rows if row.get("display_status") == "formal_interview"
+        ),
+        "offer": sum(
+            1 for row in rows if row.get("display_status") == "offer"
         ),
     }
     sources = sorted({row.get("source", "") for row in rows if row.get("source")})
@@ -2030,16 +2090,20 @@ def dashboard_transition(job_id: str):
         current_display_status = _user_status(row.get("status", ""))
         if (
             status == "ready_to_apply"
-            and current_display_status in {"submitted", "rejected", "interview", "offer", "skipped", "unavailable"}
+            and current_display_status in {
+                "submitted", "rejected", "phone_interview", "formal_interview",
+                "offer", "skipped", "unavailable",
+            }
             and not reason
         ):
-            raise ValueError("将已忽略、已失效、已提交、被拒绝、面试中或有 Offer 的岗位改回待投递时，必须填写原因")
+            raise ValueError("将已忽略、已失效、已提交、被拒绝、电话面试、正式面试或有 Offer 的岗位改回待投递时，必须填写原因")
 
         default_next_actions = {
             "ready_to_apply": "继续或重新开始投递",
             "submitted": "等待雇主回复并按计划跟进",
             "rejected": "记录拒信；必要时复盘简历和匹配规则",
-            "interview": "准备面试并记录安排",
+            "phone_interview": "准备电话面试并记录时间与联系人",
+            "formal_interview": "准备正式面试并记录轮次与安排",
             "offer": "评估 Offer 条件并确认下一步",
             "unavailable": "保留失效原因，不再进入投递选择",
         }
@@ -2108,7 +2172,10 @@ def dashboard_dismiss(job_id: str):
             raise KeyError(f"Dashboard 中找不到岗位: {job_id}")
         if row.get("status") == "skipped":
             raise ValueError("该岗位已经在已忽略列表中")
-        if row.get("status") in {"submitted", "follow_up", "rejected", "interview", "offer", "withdrawn", "unavailable"}:
+        if row.get("status") in {
+            "submitted", "follow_up", "rejected", "interview", "phone_interview",
+            "formal_interview", "offer", "withdrawn", "unavailable",
+        }:
             raise ValueError("已进入申请历史的岗位不能标记为不想要")
 
         active_attempt_statuses = {
@@ -2358,6 +2425,33 @@ def advance_attempt(attempt_id: str):
 def save():
     cfg = load_config()
 
+    current_schedule = cfg.get("scheduled_search", {})
+    has_schedule_fields = any(
+        key.startswith("schedule_") for key in request.form.keys()
+    )
+    try:
+        if has_schedule_fields:
+            schedule = normalise_scheduled_search({
+                "incremental_enabled": "schedule_incremental_enabled" in request.form,
+                "incremental_interval_minutes": request.form.get(
+                    "schedule_incremental_interval_minutes",
+                    current_schedule.get(
+                        "incremental_interval_minutes",
+                        DEFAULT_SCHEDULED_SEARCH["incremental_interval_minutes"],
+                    ),
+                ),
+                "full_enabled": "schedule_full_enabled" in request.form,
+                "full_time": request.form.get(
+                    "schedule_full_time",
+                    current_schedule.get("full_time", DEFAULT_SCHEDULED_SEARCH["full_time"]),
+                ),
+            })
+        else:
+            schedule = normalise_scheduled_search(current_schedule)
+    except ValueError as exc:
+        return redirect(url_for("index", schedule_error=f"自动搜索设置无效：{exc}"))
+    cfg["scheduled_search"] = schedule
+
     cfg["search"]["terms"] = [
         t.strip() for t in request.form.get("terms", "").splitlines() if t.strip()
     ]
@@ -2385,6 +2479,16 @@ def save():
     prefs_text = request.form.get("preferences", "")
     if prefs_text.strip():
         PREFS_PATH.write_text(prefs_text, encoding="utf-8")
+
+    if request.form.get("apply_schedule") == "1":
+        try:
+            apply_launchd_schedule(schedule, ROOT)
+        except (OSError, RuntimeError, ValueError) as exc:
+            return redirect(url_for(
+                "index", saved="1",
+                schedule_error=f"设置已保存，但 macOS 定时任务未应用：{exc}",
+            ))
+        return redirect(url_for("index", saved="1", schedule_applied="1"))
 
     return redirect(url_for("index", saved="1"))
 

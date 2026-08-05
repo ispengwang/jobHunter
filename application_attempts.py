@@ -254,7 +254,8 @@ class ApplicationAttempts:
         active = {"selected", "queued", "browser_opened", "filling", "needs_user", "ready_to_submit"}
         target_identity = _job_identity(row)
         suppressed_dashboard_statuses = {
-            "submitted", "follow_up", "rejected", "interview", "offer", "withdrawn",
+            "submitted", "follow_up", "rejected", "interview", "phone_interview",
+            "formal_interview", "offer", "withdrawn",
             "skipped", "unavailable", "blocked", "needs_user", "applying",
         }
         for sibling in self.dashboard.load_rows():
@@ -345,7 +346,8 @@ class ApplicationAttempts:
             if row.get("status") in active_statuses | terminal_statuses
         }
         suppressed_dashboard_statuses = {
-            "submitted", "follow_up", "rejected", "interview", "offer", "withdrawn",
+            "submitted", "follow_up", "rejected", "interview", "phone_interview",
+            "formal_interview", "offer", "withdrawn",
             "skipped", "unavailable", "blocked", "needs_user", "applying",
         }
         suppressed_identities = {

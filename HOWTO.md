@@ -52,6 +52,8 @@ python webapp.py
 
 然后浏览器打开 `http://127.0.0.1:5050`。这是本地网页：页面上能改常用设置、运行抓取/打分、查看结果；`/profile` 管理 Candidate Profile，`/dashboard` 管理每日行动、申请历史和单岗位投递。合格岗位卡片会显示明确按钮：平台原站打开给你操作，允许自动化的直接外部 ATS 才启动后台 ApplyPilot Agent。
 
+设置页的“自动搜索任务”区域可以开关增量搜索和每日全量搜索，调整增量间隔（30–1440 分钟）以及每日全量运行时间。点击“保存设置”只写入 `config.yaml`；确认计划后再点击“保存并应用到 macOS 定时任务”，页面才会更新并重新加载本机 `launchd` User Agent。应用动作只影响 `au.jobhunter.incremental` 和 `au.jobhunter.full` 两个 JobHunter 任务。
+
 下面的四步走是命令行版本,两种方式效果一样,挑顺手的用。
 
 ## 日常使用：四步走

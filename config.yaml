@@ -137,6 +137,14 @@ application:
   # 这里控制 Agent 是否能生成内部执行记录；JobHunter 本身仍不操作招聘网站。
   browser_enabled: true
 
+scheduled_search:
+  # 设置页面里的自动搜索计划；保存设置不会自动启停 macOS 任务。
+  # 点击“保存并应用到 macOS 定时任务”后才会更新 LaunchAgents。
+  incremental_enabled: true
+  incremental_interval_minutes: 180
+  full_enabled: true
+  full_time: "02:00"
+
 dedupe:
   # 模糊匹配阈值（0-100），同公司内比较 title
   fuzzy_threshold: 88
