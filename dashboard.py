@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 from typing import Any, Iterable
 from uuid import uuid4
 
@@ -39,6 +40,17 @@ EVENT_FIELDS = [
     "event_id", "job_id", "run_id", "timestamp", "actor", "from_status", "to_status",
     "action", "reason", "artifact_path", "details",
 ]
+
+_LEGACY_BARE_YEARS_REASON_RE = re.compile(
+    r"^JD 要求至少 (?P<years>\d+) 年经验（命中“(?P=years) years?”），"
+    r"超过 entry/junior 上限 \d+ 年$"
+)
+
+
+def _is_unverifiable_legacy_years_reason(reason: str) -> bool:
+    """Identify implausible bare-years values emitted by the old parser."""
+    match = _LEGACY_BARE_YEARS_REASON_RE.fullmatch(reason or "")
+    return bool(match and int(match.group("years")) > 20)
 
 
 def utc_now() -> str:
@@ -114,6 +126,7 @@ class Dashboard:
         )
         for row in rows:
             job = jobs_by_id.get(row.get("job_id", ""))
+            has_current_job_snapshot = job is not None
             if job is None:
                 job = Job(
                     source=row.get("source", ""),
@@ -128,14 +141,29 @@ class Dashboard:
             if not row.get("salary_raw") and job.salary_raw:
                 row["salary_raw"] = job.salary_raw
                 changed += 1
-            if not row.get("eligibility_reason"):
+            # Eligibility is a locally derived field. Recompute it whenever the
+            # current raw cache contains the JD so parser fixes repair stale
+            # Dashboard explanations without another LLM scoring request.
+            eligibility_is_stale = (
+                not has_current_job_snapshot
+                and _is_unverifiable_legacy_years_reason(
+                    row.get("eligibility_reason", "")
+                )
+            )
+            if (
+                has_current_job_snapshot
+                or not row.get("eligibility_reason")
+                or eligibility_is_stale
+            ):
                 raw_score = row.get("job_fit_score") or row.get("match_score") or ""
                 try:
                     score = int(float(raw_score))
                 except (TypeError, ValueError):
                     score = -1
-                row["eligibility_reason"] = eligibility_reason_for_job(job, score, cfg)
-                changed += 1
+                eligibility_reason = eligibility_reason_for_job(job, score, cfg)
+                if row.get("eligibility_reason") != eligibility_reason:
+                    row["eligibility_reason"] = eligibility_reason
+                    changed += 1
         if changed or needs_schema_write:
             self._write_rows(rows)
         return changed

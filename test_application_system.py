@@ -141,6 +141,58 @@ try:
     )
     check("独立函数提取 1 年要求", _min_years_required(one_year_job.description), 1)
     check("范围年限取最低值", _min_years_required("1-3 years experience"), 1)
+    check(
+        "公司经营历史不误判为候选人经验要求",
+        _min_years_required(
+            "For more than 25 years Vanguard Australia has been supporting "
+            "individual investors and financial advisers."
+        ),
+        None,
+    )
+    check(
+        "公司连续盈利年限不误判为候选人经验要求",
+        _min_years_required(
+            "We are a global financial services group operating in 30 markets "
+            "with 57 years of unbroken profitability."
+        ),
+        None,
+    )
+    check(
+        "公司集体行业经验不误判为候选人经验要求",
+        _min_years_required(
+            "With over 200 years of real estate experience, we continue to help clients."
+        ),
+        None,
+    )
+    check(
+        "无 minimum 前缀的资格列表仍提取年限",
+        _min_years_required("Qualifications:\n* 3+ years of software engineering experience"),
+        3,
+    )
+    check(
+        "带 minimum 的领域年限仍提取",
+        _min_years_required("What you will bring:\n* Minimum 7 years in product management"),
+        7,
+    )
+    check(
+        "毕业时间窗口不误判为工作经验",
+        _min_years_required(
+            "About You:\n* Must have graduated within the last 2 years."
+        ),
+        None,
+    )
+    check(
+        "固定期限合同不误判为工作经验",
+        _min_years_required("The opportunity is a 1 year, fixed term contract."),
+        None,
+    )
+    check(
+        "Markdown 转义的经验范围使用下限",
+        _min_years_required(
+            "Required Skills & Experience: 2\\-5 years in product marketing."
+        ),
+        2,
+    )
     check("JD 要求 1 年可进入海投", one_year_decision.mode, "broad")
     check("1 年要求理由可解释", "1 year" in one_year_decision.reason)
     no_year_job = Job(
@@ -343,6 +395,50 @@ try:
     check("旧岗位保留首次发现时间", after_sync["first_seen_at"], before_sync["first_seen_at"])
     check("旧岗位记录同步运行 ID", after_sync["last_run_id"], "incremental-1")
     check("旧岗位增量不新增事件", len(dashboard.events_for(job.id)), event_count)
+    stale_history_job = Job(
+        "linkedin", "Application Engineer IV", "Vanguard Australia",
+        "https://example.test/jobs/vanguard-history",
+        description=(
+            "For more than 25 years Vanguard Australia has been supporting "
+            "individual investors and financial advisers."
+        ),
+    )
+    dashboard.upsert_recommendation(
+        stale_history_job, job_fit_score=45, job_fit_reason="测试旧派生字段",
+        job_summary="公司历史不应成为候选人经验要求", sponsorship_signal="unknown",
+        resume_id=selection.resume_id, resume_fit_score=selection.fit_score,
+        resume_reason=selection.reason, application_mode="manual_review",
+        freshness_bucket="within_3d", resume_path=str(selection.path),
+        eligibility_reason="JD 要求至少 25 年经验（错误旧值）",
+    )
+    corrected = dashboard.backfill_export_fields([stale_history_job], cfg)
+    check("本地同步会纠正旧的资格判断派生值", corrected > 0)
+    check(
+        "公司历史误判会从 Dashboard 清除",
+        dashboard.get(stale_history_job.id)["eligibility_reason"],
+        "JD 未发现工作年限要求，按 entry/junior 策略放行；岗位匹配分低于海投阈值",
+    )
+    stale_without_snapshot = Job(
+        "linkedin", "Ethical Sourcing Coordinator", "MYER",
+        "https://example.test/jobs/stale-history-without-snapshot",
+    )
+    dashboard.upsert_recommendation(
+        stale_without_snapshot, job_fit_score=38, job_fit_reason="测试无快照旧值",
+        job_summary="旧缓存已不存在", sponsorship_signal="unknown",
+        resume_id=selection.resume_id, resume_fit_score=selection.fit_score,
+        resume_reason=selection.reason, application_mode="manual_review",
+        freshness_bucket="within_3d", resume_path=str(selection.path),
+        eligibility_reason=(
+            "JD 要求至少 125 年经验（命中“125 years”），"
+            "超过 entry/junior 上限 2 年"
+        ),
+    )
+    dashboard.backfill_export_fields([], cfg)
+    check(
+        "无 JD 快照的明显旧误判会降级为人工核验",
+        dashboard.get(stale_without_snapshot.id)["eligibility_reason"],
+        "当前本地没有 JD 快照，无法重新核验 entry/junior 资格，需人工确认",
+    )
     skill_path = root / "applypilot-au"
     (skill_path / "references").mkdir(parents=True)
     (skill_path / "SKILL.md").write_text("---\nname: applypilot-au\ndescription: test\n---\n", encoding="utf-8")

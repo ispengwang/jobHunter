@@ -67,10 +67,10 @@ def eligibility_reason_for_job(job, job_fit_score: int, cfg: dict) -> str:
     return eligibility_reason
 
 
-# Keep this parser deliberately small and explainable.  It extracts the first
-# number in a requirement such as "5+ years", "minimum 3 years experience",
-# or "at least 4 years"; for a range such as "1-3 years" the lower bound is
-# the relevant value.
+# Keep this parser deliberately small and explainable.  The numeric expression
+# is intentionally broader than the final result: `_experience_requirements`
+# also checks that the surrounding clause describes an applicant qualification,
+# rather than an employer's age, history, or years of profitability.
 _EXPERIENCE_RE = re.compile(
     r"""
     \b(?P<requirement>
@@ -85,6 +85,30 @@ _EXPERIENCE_RE = re.compile(
     """,
     re.IGNORECASE | re.VERBOSE,
 )
+_EXPERIENCE_LINK_RE = re.compile(
+    r"(?:years?\s*(?:['’]\s*)?(?:of\s+)?(?:[\w/-]+\s+){0,5}(?:experience|expertise))\b",
+    re.IGNORECASE,
+)
+_EXPERIENCE_DOMAIN_LINK_RE = re.compile(
+    r"\byears?\s+(?:in|as|working\s+(?:in|with|on)|developing|building|"
+    r"delivering|leading|managing|using)\b",
+    re.IGNORECASE,
+)
+_EXPERIENCE_REQUIREMENT_CUE_RE = re.compile(
+    r"\b(?:"
+    r"this\s+role\s+requires?|we\s+require|required|requirements?|qualifications?|"
+    r"about\s+you|who\s+we(?:'re|\s+are)\s+looking\s+for|looking\s+for|"
+    r"what\s+you(?:'ll|\s+will)?\s+bring|you(?:'ll|\s+will)?\s+(?:have|bring|need)|"
+    r"candidates?|applicants?|must(?:\s+have)?|should(?:\s+have)?|"
+    r"essential|preferred"
+    r")\b",
+    re.IGNORECASE,
+)
+_MINIMUM_YEARS_CUE_RE = re.compile(
+    r"\b(?:at\s+least|minimum(?:\s+of)?|a\s+minimum\s+of)\b",
+    re.IGNORECASE,
+)
+_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+")
 _EARLY_CAREER_RE = re.compile(
     r"\b(?:"
     r"no\s+(?:prior\s+)?experience\s+(?:is\s+)?(?:required|necessary)|"
@@ -96,10 +120,55 @@ _EARLY_CAREER_RE = re.compile(
 )
 
 
+def _looks_like_experience_requirement(description: str, match: re.Match[str]) -> bool:
+    """Return whether a numeric years phrase is an applicant requirement.
+
+    Job descriptions frequently contain employer-history prose such as "for 25
+    years" or "57 years of unbroken profitability".  A years phrase is accepted
+    only when the local line/clause provides a qualification cue, or when an
+    experience phrase appears as a standalone/listed requirement.
+    """
+    start, end = match.span("requirement")
+    line_start = description.rfind("\n", 0, start) + 1
+    line_end = description.find("\n", end)
+    if line_end < 0:
+        line_end = len(description)
+    line = description[line_start:line_end]
+    # Include a nearby section heading (often the preceding line, such as
+    # "Required skills") while keeping the context narrow.
+    local_start = max(0, start - 160)
+    local_end = min(len(description), end + 120)
+    local_context = description[local_start:local_end]
+
+    years_context = description[start:min(line_end, end + 100)]
+    experience_linked = bool(_EXPERIENCE_LINK_RE.search(years_context))
+    domain_linked = bool(_EXPERIENCE_DOMAIN_LINK_RE.search(years_context))
+    minimum_cued = bool(_MINIMUM_YEARS_CUE_RE.search(local_context))
+    requirement_cued = bool(_EXPERIENCE_REQUIREMENT_CUE_RE.search(local_context))
+    line_prefix = description[line_start:start]
+    inline_list_item = bool(re.search(
+        r"(?:^|\s)(?:[-*•]|\d+[.)])(?:\s|\\~|[*_])*$", line_prefix,
+    ))
+    starts_requirement = (
+        not line_prefix.strip() or bool(_LIST_ITEM_RE.match(line)) or inline_list_item
+    )
+    linked_to_candidate_work = experience_linked or domain_linked
+    if requirement_cued and (linked_to_candidate_work or minimum_cued):
+        return True
+    if inline_list_item and (linked_to_candidate_work or minimum_cued):
+        return True
+    return starts_requirement and (linked_to_candidate_work or minimum_cued)
+
+
 def _experience_requirements(description: str) -> list[tuple[int, str]]:
     """Return ``(minimum_years, source_text)`` pairs from a job description."""
+    # LinkedIn Markdown escapes range punctuation (for example ``2\-5``).
+    # Removing only those escape slashes preserves the meaning before matching.
+    normalised = re.sub(r"\\(?=[+\-–—])", "", description or "")
     requirements: list[tuple[int, str]] = []
-    for match in _EXPERIENCE_RE.finditer(description or ""):
+    for match in _EXPERIENCE_RE.finditer(normalised):
+        if not _looks_like_experience_requirement(normalised, match):
+            continue
         requirements.append((int(match.group("years")), match.group("requirement").strip()))
     return requirements
 
